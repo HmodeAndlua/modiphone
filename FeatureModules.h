@@ -855,7 +855,7 @@ static bool Hook_ItemTryUseLocal(void* self, int64_t itemEnt, int32_t dragSource
 }
 
 static void Hook_ApplyLocalFallDamage(void* self, int64_t pedViewEntity, float fallHeight, void* method) {
-    if (!g_cfgState.bMasterDisable && g_cfgState.bNoFall) return;
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bNoFall || IsGhostProtectedNow())) return;
     if (orig_ApplyLocalFallDamage) orig_ApplyLocalFallDamage(self, pedViewEntity, fallHeight, method);
 }
 
@@ -1799,15 +1799,13 @@ inline void TickMovementMods(float dt) {
     }
 
     // =========================================================================
-    // Smooth Game-Controlled Skywalk (Ped Fly) & Car Fly — ZERO Fake Joystick!
-    // Driven directly by the game's own InputsData & VehicleViewInputs buttons
-    // + Camera look direction (pitch up = climb, pitch down = descend, release = hover still!)
+    // Real Invisible-Floor Skywalk (Ped walks/aims/shoots 100% normally on a
+    // solid invisible sky platform!) + Smooth Game-Controlled Car Fly
     // =========================================================================
-    static bool  s_pedFlyActive = false;
-    static Vec3  s_pedFlyPos{};
-    static float s_pedFlyYaw    = 0.0f;
-    static void* s_pedFlyActor  = nullptr;
-    static void* s_pedFlyRb     = nullptr;
+    static bool  s_skyFloorActive = false;
+    static void* s_skyFloorGo     = nullptr;
+    static void* s_skyFloorTr     = nullptr;
+    static float s_skyFloorY      = 0.0f;
 
     static bool  s_carFlyActive = false;
     static Vec3  s_carFlyPos{};
@@ -1850,7 +1848,6 @@ inline void TickMovementMods(float dt) {
             }
         };
 
-        // Prefer local player / local ped entity first so stale or remote entries never cause auto-walking!
         bool gotLocalInp = false;
         if (SafeMem::IsPlausiblePtr(Morpeh::g_stashes.inputsDataStash)) {
             int32_t localPlayerId = Morpeh::GetLocalPlayerId();
@@ -1868,7 +1865,6 @@ inline void TickMovementMods(float dt) {
                 }
             }
             if (!gotLocalInp) {
-                // Fallback: singleton InputsData entity (usually only 1 slot exists)
                 int seen = 0;
                 Morpeh::ForEachSlotEntityId(Morpeh::g_stashes.inputsDataStash, [&](int32_t id, int) {
                     if (seen >= 2) return;
@@ -1880,7 +1876,6 @@ inline void TickMovementMods(float dt) {
             }
         }
 
-        // Read VehicleViewInputs directly from the local driven vehicle (verified dump1.4.1.cpp L117448)
         if (vehLogic > 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.vehViewInputsStash)) {
             auto readVehInp = [&](int32_t eid) {
                 if (eid < 0) return false;
@@ -1904,7 +1899,6 @@ inline void TickMovementMods(float dt) {
             }
         }
 
-        // Apply crisp deadzone so releasing the game stick gives EXACT zero drift
         if (std::fabs(in.pedH) < 0.12f) in.pedH = 0.0f;
         if (std::fabs(in.pedV) < 0.12f) in.pedV = 0.0f;
         if (in.carGas < 0.08f)          in.carGas = 0.0f;
@@ -1913,25 +1907,14 @@ inline void TickMovementMods(float dt) {
         return in;
     };
 
-    auto restorePedFlyPhysics = [&]() {
-        if (!s_pedFlyActive) return;
-        if (s_pedFlyActor && Il2Cpp::IsUnityNativeAlive(s_pedFlyActor)) {
-            Il2Cpp::SafeSetBehaviourEnabled(s_pedFlyActor, true);
-            if (Il2Cpp::g_unity.mPhysActor_SetVel) {
-                Vec3 z{0, 0, 0};
-                void* va[1] = { &z };
-                Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetVel, s_pedFlyActor, va);
-            }
+    auto disableSkyFloor = [&]() {
+        if (!s_skyFloorActive) return;
+        if (s_skyFloorGo && Il2Cpp::IsGameObjectAlive(s_skyFloorGo)) {
+            Il2Cpp::SafeSetGameObjectActive(s_skyFloorGo, false);
         }
-        if (s_pedFlyRb && Il2Cpp::IsRigidbodyAlive(s_pedFlyRb)) {
-            Il2Cpp::SafeSetRbKinematic(s_pedFlyRb, false);
-            Il2Cpp::SafeSetRbGravity(s_pedFlyRb, true);
-            Il2Cpp::SafeSetRbDetectCollisions(s_pedFlyRb, true);
-            Il2Cpp::SafeSetRbVelocity(s_pedFlyRb, {0, 0, 0});
-        }
-        s_pedFlyActive = false;
-        s_pedFlyActor = nullptr;
-        s_pedFlyRb = nullptr;
+        // Grant brief fall-damage grace when stepping off the sky floor
+        Hooks::g_fcReturnGraceUntil.store(CACurrentMediaTime() + 3.5, std::memory_order_release);
+        s_skyFloorActive = false;
     };
 
     auto restoreCarFlyPhysics = [&]() {
@@ -1945,11 +1928,11 @@ inline void TickMovementMods(float dt) {
         s_carFlyRb = nullptr;
     };
 
-    bool pedFly = g_cfgState.bFlyHack && !g_cfgState.bFreeCam;
-    bool carFly = g_cfgState.bCarFly && !g_cfgState.bFreeCam;
+    bool pedFly = g_cfgState.bFlyHack && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive;
+    bool carFly = g_cfgState.bCarFly && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive;
     int64_t veh = Morpeh::GetLocalVehicleLogicEntity(ped);
 
-    if (!pedFly || veh > 0) restorePedFlyPhysics();
+    if (!pedFly || veh > 0) disableSkyFloor();
     if (!carFly || veh <= 0) restoreCarFlyPhysics();
 
     if (pedFly || carFly) {
@@ -1984,10 +1967,8 @@ inline void TickMovementMods(float dt) {
                     float throttle = gi.carHandbrake ? 0.0f : (gi.carGas - gi.carBrake);
                     float steer = gi.carSteer;
 
-                    // Steer rotates yaw smoothly; camera pitch controls climb/dive while moving forward/back
                     s_carFlyYaw += steer * 2.15f * dt;
                     if (std::fabs(throttle) > 0.05f && std::fabs(steer) < 0.05f) {
-                        // Gently align heading toward camera horizontal direction when driving straight
                         float camYaw = std::atan2(fwd.x, fwd.z);
                         float diff = std::atan2(std::sin(camYaw - s_carFlyYaw), std::cos(camYaw - s_carFlyYaw));
                         s_carFlyYaw += diff * std::clamp(dt * 4.5f, 0.0f, 1.0f);
@@ -2025,102 +2006,66 @@ inline void TickMovementMods(float dt) {
                 }
             }
         }
-        // --- PLAYER SKYWALK (100% controlled by Game Move Stick + Jump/Crouch + Camera Pitch!) ---
+        // --- TRUE INVISIBLE-FLOOR SKYWALK (Player stands/walks/aims/shoots 100% normally in the sky!) ---
         else if (pedFly && tr && Il2Cpp::IsTransformAlive(tr)) {
-            if (!s_pedFlyActive) {
-                Vec3 startPos{};
-                if (ReadTransformPosition(tr, startPos)) {
-                    s_pedFlyPos   = { startPos.x, startPos.y + 0.25f, startPos.z };
-                    s_pedFlyYaw   = std::atan2(fwd.x, fwd.z);
-                    s_pedFlyActor = actor;
-                    s_pedFlyRb    = rb;
-                    s_pedFlyActive = true;
-                }
-            }
-            if (s_pedFlyActive) {
-                s_pedFlyActor = actor;
-                s_pedFlyRb    = rb;
-
-                // Keep CharacterActor ENABLED so animations & smooth turning stay natural (never stiff/frozen!)
-                if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
-                    Il2Cpp::SafeSetBehaviourEnabled(actor, true);
-                    if (Il2Cpp::g_unity.mCharActor_ForceNotGrounded) {
-                        int32_t frames = 3;
-                        void* fa[1] = { &frames };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mCharActor_ForceNotGrounded, actor, fa);
+            Vec3 footPos{};
+            if (ReadTransformPosition(tr, footPos) && IsFiniteVec3(footPos)) {
+                // Lazily spawn or reactivate the invisible solid sky floor collider
+                if (!s_skyFloorGo || !Il2Cpp::IsGameObjectAlive(s_skyFloorGo) || !Il2Cpp::IsTransformAlive(s_skyFloorTr)) {
+                    int32_t groundLayer = 0;
+                    uint32_t gMask = static_cast<uint32_t>(Hooks::g_groundLayerMask.load(std::memory_order_acquire));
+                    if (gMask != 0 && gMask != 0xFFFFFFFFU) {
+                        for (int bit = 0; bit < 32; ++bit) {
+                            if (gMask & (1u << bit)) { groundLayer = bit; break; }
+                        }
                     }
-                }
-                if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
-                    Il2Cpp::SafeSetRbGravity(rb, false);
-                    Il2Cpp::SafeSetRbVelocity(rb, {0, 0, 0});
+                    s_skyFloorGo = Il2Cpp::SafeCreateInvisibleSkyFloor(groundLayer, s_skyFloorTr);
                 }
 
-                float inH = gi.pedH;
-                float inV = gi.pedV;
-                float vertBtn = (gi.jump ? 1.0f : 0.0f) - (gi.crouch ? 1.0f : 0.0f);
-                bool hasMoveInput = (std::fabs(inH) > 0.01f || std::fabs(inV) > 0.01f || std::fabs(vertBtn) > 0.01f);
-
-                float spd = std::clamp(g_cfgState.flySpeed, 2.0f, 80.0f) * (gi.sprint ? 1.55f : 1.0f);
-                Vec3 moveVel{0, 0, 0};
-
-                if (hasMoveInput) {
-                    // Horizontal movement along camera XZ; camera vertical pitch lifts/lowers smoothly while pushing forward/back!
-                    Vec3 flatFwd = Vec3Norm({ fwd.x, 0.0f, fwd.z });
-                    Vec3 flatRight = Vec3Norm({ right.x, 0.0f, right.z });
-                    float pitchClimb = (std::fabs(fwd.y) > 0.14f) ? (fwd.y * inV) : 0.0f;
-                    Vec3 dir{
-                        flatFwd.x * inV + flatRight.x * inH,
-                        pitchClimb + vertBtn * 0.85f,
-                        flatFwd.z * inV + flatRight.z * inH
-                    };
-                    float mag = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-                    if (mag > 1.0f) { dir.x /= mag; dir.y /= mag; dir.z /= mag; }
-
-                    moveVel = { dir.x * spd, dir.y * spd, dir.z * spd };
-                    s_pedFlyPos.x += moveVel.x * dt;
-                    s_pedFlyPos.y += moveVel.y * dt;
-                    s_pedFlyPos.z += moveVel.z * dt;
-
-                    float hMag = std::hypot(dir.x, dir.z);
-                    if (hMag > 0.12f) {
-                        float tgtYaw = std::atan2(dir.x, dir.z);
-                        float diff = std::atan2(std::sin(tgtYaw - s_pedFlyYaw), std::cos(tgtYaw - s_pedFlyYaw));
-                        s_pedFlyYaw += diff * std::clamp(dt * 12.0f, 0.0f, 1.0f);
+                if (!s_skyFloorActive) {
+                    s_skyFloorY = footPos.y - 0.02f;
+                    if (s_skyFloorGo && Il2Cpp::IsGameObjectAlive(s_skyFloorGo)) {
+                        Il2Cpp::SafeSetGameObjectActive(s_skyFloorGo, true);
                     }
+                    s_skyFloorActive = true;
                 }
 
-                NotifySelfTeleport();
-                Quat pedRot = YawToQuat(s_pedFlyYaw);
-                const auto& cfg = Offsets::g_cfg;
-                if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
-                    SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offPhysActorStartPos,  &s_pedFlyPos, sizeof(Vec3));
-                    SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offPhysActorTargetPos, &s_pedFlyPos, sizeof(Vec3));
-                    if (Il2Cpp::g_unity.mPhysActor_Teleport2) {
-                        Vec3 p = s_pedFlyPos;
-                        Quat q = pedRot;
-                        void* args[2] = { &p, &q };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_Teleport2, actor, args);
-                    } else if (Il2Cpp::g_unity.mPhysActor_SetPos) {
-                        Vec3 p = s_pedFlyPos;
-                        void* args[1] = { &p };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetPos, actor, args);
-                    }
-                    if (Il2Cpp::g_unity.mPhysActor_SetVel) {
-                        Vec3 v = moveVel;
-                        void* va[1] = { &v };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetVel, actor, va);
-                    }
-                } else {
-                    Il2Cpp::SafeSetTransformPos(tr, s_pedFlyPos);
-                    Il2Cpp::SafeSetTransformRot(tr, pedRot);
-                    if (rb && Il2Cpp::IsRigidbodyAlive(rb)) Il2Cpp::SafeSetRbPosition(rb, s_pedFlyPos);
+                float climbRate = std::clamp(g_cfgState.flySpeed * 0.45f, 2.0f, 18.0f);
+                if (gi.jump) {
+                    // Holding Jump smoothly lifts the invisible sky floor upward!
+                    s_skyFloorY += climbRate * dt;
+                } else if (gi.crouch) {
+                    // Holding Crouch smoothly lowers the invisible sky floor downward!
+                    s_skyFloorY -= climbRate * dt;
+                } else if (std::fabs(gi.pedV) > 0.15f && std::fabs(fwd.y) > 0.24f) {
+                    // Walking while looking clearly up or down slopes the sky floor smoothly like invisible stairs!
+                    s_skyFloorY += fwd.y * gi.pedV * climbRate * 0.80f * dt;
                 }
-                Il2Cpp::SafePhysicsSyncTransforms();
 
-                int32_t pedId = Morpeh::UnpackEntityId(ped);
-                if (pedId >= 0) {
-                    if (void* posPtr = Morpeh::Get(Morpeh::g_stashes.positionStash, pedId, sizeof(Vec3))) {
-                        SafeMem::Write(posPtr, &s_pedFlyPos, sizeof(Vec3));
+                // If the player naturally jumped higher than the sky floor, raise the floor to catch them at the peak!
+                if (footPos.y > s_skyFloorY + 0.35f && footPos.y < s_skyFloorY + 3.2f) {
+                    s_skyFloorY = footPos.y - 0.05f;
+                }
+                // Safety net: never allow the player to fall below their own sky floor!
+                if (footPos.y < s_skyFloorY - 0.55f) {
+                    s_skyFloorY = footPos.y - 0.03f;
+                }
+
+                // Slide the 16x0.4x16 invisible solid floor directly beneath the player's feet (top surface = s_skyFloorY)
+                if (s_skyFloorTr && Il2Cpp::IsTransformAlive(s_skyFloorTr)) {
+                    Vec3 floorCenter{ footPos.x, s_skyFloorY - 0.20f, footPos.z };
+                    Il2Cpp::SafeSetTransformPos(s_skyFloorTr, floorCenter);
+                    Il2Cpp::SafePhysicsSyncTransforms();
+                }
+
+                // If player is rising via Jump hold and still below new floor top, lift feet smoothly onto floor top
+                if (gi.jump && footPos.y < s_skyFloorY - 0.02f) {
+                    Vec3 lifted{ footPos.x, s_skyFloorY + 0.02f, footPos.z };
+                    if (actor && Il2Cpp::IsUnityNativeAlive(actor) && Il2Cpp::g_unity.mPhysActor_SetPos) {
+                        void* a[1] = { &lifted };
+                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetPos, actor, a);
+                    } else {
+                        Il2Cpp::SafeSetTransformPos(tr, lifted);
                     }
                 }
             }
@@ -2471,59 +2416,6 @@ inline void ApplyGhostUndergroundAnchorToLocal(int64_t localPed, const Vec3& anc
     }
 }
 
-inline void ReleaseGhostUndergroundAnchor(int64_t localPed) {
-    Hooks::g_fcGhostAnchorActive.store(false, std::memory_order_release);
-    Hooks::g_fcCamLockActive.store(false, std::memory_order_release);
-    Hooks::g_fcHasSurfaceAudio.store(false, std::memory_order_release);
-    Hooks::g_fcReturnGraceUntil.store(CACurrentMediaTime() + 2.5, std::memory_order_release);
-
-    const auto& cfg = Offsets::g_cfg;
-    if (Hooks::g_hasSavedPedGravity) {
-        if (void* pp = Hooks::g_pedPhysicsParamsInst.load(std::memory_order_acquire)) {
-            SafeMem::Write(reinterpret_cast<uint8_t*>(pp) + cfg.offPedPhysicsGravInAir,
-                           &Hooks::g_savedPedGravityInAir, sizeof(int32_t));
-        }
-    }
-
-    int64_t ped = (localPed > 0) ? localPed : Morpeh::GetLocalPedEntity();
-    if (ped > 0) {
-        int64_t view = Morpeh::GetViewEntity(ped);
-        int32_t vid  = (view > 0) ? Morpeh::UnpackEntityId(view) : -1;
-        if (void* pv = (vid >= 0) ? Morpeh::Get(Morpeh::g_stashes.pedViewStash, vid, 384) : nullptr) {
-            void* actor = SafeMem::PtrAt(pv, cfg.offPedViewActor);
-            void* rb    = SafeMem::PtrAt(pv, cfg.offPedViewRigidbody);
-            if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
-                if (g_fcSavedRemovePenValid) {
-                    SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorRemovePen,
-                                   &g_fcSavedRemovePenAction, sizeof(void*));
-                }
-                Vec3 zero{};
-                uint8_t one = 1;
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorInVel,    &zero, sizeof(Vec3));
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorPreVel,   &zero, sizeof(Vec3));
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorPostVel,  &zero, sizeof(Vec3));
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorExtVel,   &zero, sizeof(Vec3));
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorGrounded, &one, 1);
-                SafeMem::Write(reinterpret_cast<uint8_t*>(actor) + cfg.offCharActorStable,   &one, 1);
-            }
-            if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
-                Il2Cpp::SafeSetRbDetectCollisions(rb, true);
-                Il2Cpp::SafeSetRbGravity(rb, true);
-                Il2Cpp::SafeSetRbKinematic(rb, false);
-                Il2Cpp::SafeSetRbVelocity(rb, {0, 0, 0});
-            }
-        }
-    }
-    g_fcSavedRemovePenAction = nullptr;
-    g_fcSavedRemovePenValid = false;
-
-    if (g_fcHasGhostOrigin && IsFiniteVec3(g_fcGhostOriginPos)) {
-        Vec3 retPos = g_fcGhostOriginPos;
-        g_fcHasGhostOrigin = false;
-        TeleportLocalTo(retPos, {0, 0, 0}, true);
-    }
-}
-
 struct MapTpLandingState {
     bool    active      = false;
     bool    inVehicle   = false;
@@ -2535,6 +2427,87 @@ struct MapTpLandingState {
     void*   savedRb     = nullptr;
 };
 inline MapTpLandingState g_mapTpLanding{};
+
+inline bool TryFindGroundY(float x, float z, float& outY);
+inline void ApplyDirectEntityTeleport(int64_t ped, int64_t veh, const Vec3& dst, bool holdKinematic);
+
+inline void ReleaseGhostUndergroundAnchor(int64_t localPed) {
+    Hooks::g_fcGhostAnchorActive.store(false, std::memory_order_release);
+    Hooks::g_fcCamLockActive.store(false, std::memory_order_release);
+    Hooks::g_fcHasSurfaceAudio.store(false, std::memory_order_release);
+    // Extended 4.5s grace period protects ped from fall/off-map/void kills while terrain streams back in!
+    Hooks::g_fcReturnGraceUntil.store(CACurrentMediaTime() + 4.5, std::memory_order_release);
+
+    const auto& cfg = Offsets::g_cfg;
+    if (Hooks::g_hasSavedPedGravity) {
+        if (void* pp = Hooks::g_pedPhysicsParamsInst.load(std::memory_order_acquire)) {
+            SafeMem::Write(reinterpret_cast<uint8_t*>(pp) + cfg.offPedPhysicsGravInAir,
+                           &Hooks::g_savedPedGravityInAir, sizeof(int32_t));
+        }
+    }
+
+    int64_t ped = (localPed > 0) ? localPed : Morpeh::GetLocalPedEntity();
+    void* savedActor = nullptr;
+    void* savedRb = nullptr;
+    if (ped > 0) {
+        int64_t view = Morpeh::GetViewEntity(ped);
+        int32_t vid  = (view > 0) ? Morpeh::UnpackEntityId(view) : -1;
+        if (void* pv = (vid >= 0) ? Morpeh::Get(Morpeh::g_stashes.pedViewStash, vid, 384) : nullptr) {
+            savedActor = SafeMem::PtrAt(pv, cfg.offPedViewActor);
+            savedRb    = SafeMem::PtrAt(pv, cfg.offPedViewRigidbody);
+            if (savedActor && Il2Cpp::IsUnityNativeAlive(savedActor)) {
+                if (g_fcSavedRemovePenValid) {
+                    SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorRemovePen,
+                                   &g_fcSavedRemovePenAction, sizeof(void*));
+                }
+                Vec3 zero{};
+                uint8_t one = 1;
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorInVel,    &zero, sizeof(Vec3));
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorPreVel,   &zero, sizeof(Vec3));
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorPostVel,  &zero, sizeof(Vec3));
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorExtVel,   &zero, sizeof(Vec3));
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorGrounded, &one, 1);
+                SafeMem::Write(reinterpret_cast<uint8_t*>(savedActor) + cfg.offCharActorStable,   &one, 1);
+            }
+            // Restore collision detection now, but DO NOT re-enable gravity while still underground!
+            if (savedRb && Il2Cpp::IsRigidbodyAlive(savedRb)) {
+                Il2Cpp::SafeSetRbDetectCollisions(savedRb, true);
+                Il2Cpp::SafeSetRbVelocity(savedRb, {0, 0, 0});
+            }
+        }
+    }
+    g_fcSavedRemovePenAction = nullptr;
+    g_fcSavedRemovePenValid = false;
+
+    if (g_fcHasGhostOrigin && IsFiniteVec3(g_fcGhostOriginPos)) {
+        Vec3 retPos = g_fcGhostOriginPos;
+        g_fcHasGhostOrigin = false;
+        // Use ground-verified safe return: if terrain at origin is unloaded after far spectate/freecam,
+        // hold ped safely in kinematic hover above origin until terrain collider streams back in!
+        float groundY = 0.0f;
+        if (TryFindGroundY(retPos.x, retPos.z, groundY)) {
+            float safeY = std::max(retPos.y, groundY + 0.35f) + 0.85f;
+            TeleportLocalTo({ retPos.x, safeY, retPos.z }, {0, 0, 0}, true);
+        } else {
+            // Far origin terrain unloaded -> engage hover-settle until terrain raycast confirms solid ground!
+            Vec3 hover{ retPos.x, retPos.y + 3.5f, retPos.z };
+            int64_t veh = (ped > 0) ? Morpeh::GetLocalVehicleLogicEntity(ped) : -1;
+            g_mapTpLanding = MapTpLandingState{};
+            g_mapTpLanding.active      = true;
+            g_mapTpLanding.inVehicle   = (veh > 0);
+            g_mapTpLanding.vehLogicEnt = veh;
+            g_mapTpLanding.targetRaw   = { retPos.x, retPos.y + 1.0f, retPos.z };
+            g_mapTpLanding.hoverPos    = hover;
+            g_mapTpLanding.startedAt   = CACurrentMediaTime();
+            g_mapTpLanding.savedActor  = savedActor;
+            g_mapTpLanding.savedRb     = savedRb;
+            ApplyDirectEntityTeleport(ped, veh, hover, true);
+        }
+    } else if (savedRb && Il2Cpp::IsRigidbodyAlive(savedRb)) {
+        Il2Cpp::SafeSetRbGravity(savedRb, true);
+        Il2Cpp::SafeSetRbKinematic(savedRb, false);
+    }
+}
 
 inline void StopSpectate() {
     Hooks::EnsureFreeCamSystemPatches();
@@ -3423,10 +3396,11 @@ inline void TickFreeCam(int64_t localPed, float dt) {
         Hooks::EnsureFreeCamSystemPatches();
         Hooks::EnsureFreeCamVoiceAndImmunityHooks();
         if (!g_freeCamWasActive) {
-            if (g_cfgState.bFreeCamGhostVoice && !g_fcHasGhostOrigin) {
+            // ALWAYS save local ped origin on FreeCam start so the player is protected from falling & returned safely!
+            if (!g_fcHasGhostOrigin) {
                 Vec3 origPos{};
                 if (GetLocalPosition(origPos) && IsFiniteVec3(origPos)) {
-                    g_fcGhostOriginPos = origPos;
+                    g_fcGhostOriginPos = { origPos.x, origPos.y + 0.35f, origPos.z };
                     g_fcHasGhostOrigin = true;
                 }
             }
@@ -3484,8 +3458,10 @@ inline void TickFreeCam(int64_t localPed, float dt) {
                             Vec3 anchor{ g_freeCamPos.x, g_freeCamPos.y + depthY, g_freeCamPos.z };
                             Hooks::g_fcGhostAnchorActive.store(true, std::memory_order_release);
                             ApplyGhostUndergroundAnchorToLocal(localPed, anchor);
-                        } else if (Hooks::g_fcGhostAnchorActive.load(std::memory_order_acquire)) {
-                            ReleaseGhostUndergroundAnchor(localPed);
+                        } else if (localPed > 0 && g_fcHasGhostOrigin) {
+                            // Even without Ghost Voice, hold local ped safely anchored at saved origin so it NEVER falls!
+                            Hooks::g_fcGhostAnchorActive.store(true, std::memory_order_release);
+                            ApplyGhostUndergroundAnchorToLocal(localPed, g_fcGhostOriginPos);
                         }
                     }
                 }
@@ -3659,10 +3635,11 @@ inline void RefreshWorldSnapshot(float dt) {
     TickFreeCam(localPed, dt);
     if (localPlayer > 0) TickRadioOverride(localPlayer);
 
-    // Throttle heavy ECS entity scans to ~8 Hz (live bone/root positions refresh at 60/120fps in DrawOverlayVisuals)
+    // Adaptive ECS scan cadence: 8Hz normally, ~6Hz in crowded areas (>16 players) to keep 60-120fps silky smooth
     static double s_lastEcsScan = 0.0;
     double now = CACurrentMediaTime();
-    if (now - s_lastEcsScan < 0.125) return;
+    double ecsInterval = (g_renderPlayers.size() > 16) ? 0.165 : 0.125;
+    if (now - s_lastEcsScan < ecsInterval) return;
     s_lastEcsScan = now;
 
     Vec3 camPos{};
@@ -3866,7 +3843,7 @@ inline void RefreshWorldSnapshot(float dt) {
             }
 
             // Skeleton Bone Transform resolution (PedView IK bones + Animator::GetBoneTransformInternal fallback)
-            if (g_cfgState.bSkeletonESP) {
+            if (g_cfgState.bSkeletonESP && (!hasLocalPos || Vec3Dist(localPos, footPos) <= 105.0f)) {
                 void* rawTr[15] = {
                     pl.headTransform,
                     pl.chestTransform,
@@ -4465,6 +4442,9 @@ inline void DrawOverlayVisuals(ImDrawList* bg, float w, float h) {
 
     if (!g_cfgState.bEnableESP || !hasCam) return;
 
+    // ZERO-LAG MATRIX W2S: fetch View*Projection ONCE per frame -> pure C++ math for ALL players & bones!
+    Il2Cpp::FrameCameraVP fvp = Il2Cpp::BuildFrameCameraVP(cam);
+
     static constexpr int kBoneEdges[14][2] = {
         {0, 1}, {1, 2},           // Head -> Chest -> Hips
         {1, 3}, {3, 4}, {4, 5},   // Right Arm
@@ -4474,26 +4454,30 @@ inline void DrawOverlayVisuals(ImDrawList* bg, float w, float h) {
     };
 
     int count = 0;
+    int liveSkelBudget = 6; // Refresh live 15-bone transforms only for closest/first 6 visible players; shift cached bones for crowd!
     for (const ESPPlayer& pl : snapshot) {
         if (pl.dead || pl.roleCategory < 0 || pl.roleCategory > 10) continue;
         if (!g_cfgState.bShowRole[pl.roleCategory] || g_cfgState.bHideRole[pl.roleCategory]) continue;
 
-        // Live 0-lag transform read directly at draw time (exact ldr.saw.deb DrawVisuals behavior)
+        // Fast 1-transform read per player; derive head using cached head-to-foot offset (cuts 50% of transform icalls!)
         Vec3 liveFoot = pl.worldPos;
-        Vec3 liveHead = pl.headPos;
         if (pl.rootTransform) ReadTransformPosition(pl.rootTransform, liveFoot);
-        if (pl.headTransform) ReadTransformPosition(pl.headTransform, liveHead);
-        else liveHead = { liveFoot.x, liveFoot.y + 1.65f, liveFoot.z };
+        Vec3 delta{ liveFoot.x - pl.worldPos.x, liveFoot.y - pl.worldPos.y, liveFoot.z - pl.worldPos.z };
+        Vec3 liveHead{ pl.headPos.x + delta.x, pl.headPos.y + delta.y, pl.headPos.z + delta.z };
 
-        if (hasCamPos && Vec3Dist(camPos, liveFoot) > g_cfgState.espRadiusValue) continue;
+        float dist = hasCamPos ? Vec3Dist(camPos, liveFoot) : 0.0f;
+        if (hasCamPos && dist > g_cfgState.espRadiusValue) continue;
 
         // Top of skull = headBone + 0.22m, bottom of shoes = root - 0.04m
         Vec3 topWorld{ liveHead.x, liveHead.y + 0.22f, liveHead.z };
         Vec3 botWorld{ liveFoot.x, liveFoot.y - 0.04f, liveFoot.z };
 
         Vec2 footS{}, headS{};
-        if (!WorldToScreenViewport(cam, botWorld, w, h, footS)) continue;
-        if (!WorldToScreenViewport(cam, topWorld, w, h, headS)) continue;
+        if (!Il2Cpp::ProjectWorldToScreenFast(fvp, cam, botWorld, w, h, footS)) continue;
+        if (!Il2Cpp::ProjectWorldToScreenFast(fvp, cam, topWorld, w, h, headS)) continue;
+
+        // Fast off-screen frustum cull before allocating strings or drawing primitives
+        if (footS.x < -140.0f || footS.x > w + 140.0f || headS.y > h + 140.0f || footS.y < -140.0f) continue;
 
         float topY = std::min(headS.y, footS.y);
         float botY = std::max(headS.y, footS.y);
@@ -4532,27 +4516,29 @@ inline void DrawOverlayVisuals(ImDrawList* bg, float w, float h) {
             bg->AddRectFilled(ImVec2(x0, y0 + boxH + 2), ImVec2(x0 + boxW, y0 + boxH + 5), IM_COL32(10, 12, 16, 195));
             bg->AddRectFilled(ImVec2(x0, y0 + boxH + 2.5f), ImVec2(x0 + boxW * ar, y0 + boxH + 4.5f), IM_COL32(60, 165, 255, 245));
         }
-        if (g_cfgState.bSkeletonESP && pl.hasBones) {
-            Vec3 liveBones[15]{};
-            bool liveValid[15]{};
+        if (g_cfgState.bSkeletonESP && pl.hasBones && (!hasCamPos || dist <= 95.0f)) {
+            Vec2 boneScr[15]{};
+            bool boneOk[15]{};
+            bool readLiveBones = (liveSkelBudget > 0 && dist <= 55.0f);
+            if (readLiveBones) --liveSkelBudget;
             for (int bi = 0; bi < 15; ++bi) {
                 Vec3 bp{};
-                if (pl.boneTransforms[bi] && Il2Cpp::SafeGetTransformPos(pl.boneTransforms[bi], bp) &&
+                bool gotBp = false;
+                if (readLiveBones && pl.boneTransforms[bi] && Il2Cpp::SafeGetTransformPos(pl.boneTransforms[bi], bp) &&
                     Vec3Dist(bp, liveFoot) < 2.8f) {
-                    liveBones[bi] = bp;
-                    liveValid[bi] = true;
-                } else if (pl.boneValid[bi] && Vec3Dist(pl.bonePoints[bi], liveFoot) < 2.8f) {
-                    liveBones[bi] = pl.bonePoints[bi];
-                    liveValid[bi] = true;
+                    gotBp = true;
+                } else if (pl.boneValid[bi]) {
+                    bp = { pl.bonePoints[bi].x + delta.x, pl.bonePoints[bi].y + delta.y, pl.bonePoints[bi].z + delta.z };
+                    gotBp = true;
+                }
+                if (gotBp && Il2Cpp::ProjectWorldToScreenFast(fvp, cam, bp, w, h, boneScr[bi])) {
+                    boneOk[bi] = true;
                 }
             }
             for (int e = 0; e < 14; ++e) {
                 int i0 = kBoneEdges[e][0], i1 = kBoneEdges[e][1];
-                if (!liveValid[i0] || !liveValid[i1]) continue;
-                Vec2 a{}, z{};
-                if (WorldToScreenViewport(cam, liveBones[i0], w, h, a) &&
-                    WorldToScreenViewport(cam, liveBones[i1], w, h, z)) {
-                    bg->AddLine(ImVec2(a.x, a.y), ImVec2(z.x, z.y), skelCol, 1.35f);
+                if (boneOk[i0] && boneOk[i1]) {
+                    bg->AddLine(ImVec2(boneScr[i0].x, boneScr[i0].y), ImVec2(boneScr[i1].x, boneScr[i1].y), skelCol, 1.35f);
                 }
             }
         }

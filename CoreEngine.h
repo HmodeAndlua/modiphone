@@ -827,6 +827,8 @@ struct UnityIcalls {
     bool resolved = false;
     void* (*Camera_get_main)() = nullptr;
     void  (*Camera_WorldToViewportPoint_Injected)(void* cam, const Vec3* pos, int32_t eye, Vec3* outVp) = nullptr;
+    void  (*Camera_get_worldToCameraMatrix_Injected)(void* cam, float* outMat16) = nullptr;
+    void  (*Camera_get_projectionMatrix_Injected)(void* cam, float* outMat16) = nullptr;
     float (*Camera_get_fov)(void* cam) = nullptr;
     void  (*Camera_set_fov)(void* cam, float fov) = nullptr;
     float (*Camera_get_aspect)(void* cam) = nullptr;
@@ -834,6 +836,9 @@ struct UnityIcalls {
     void* (*Comp_get_transform)(void* comp) = nullptr;
     void* (*Comp_get_gameObject)(void* comp) = nullptr;
     void  (*GameObject_SetActive)(void* go, bool active) = nullptr;
+    void* (*GameObject_CreatePrimitive)(int32_t primType) = nullptr;
+    void  (*GameObject_set_layer)(void* go, int32_t layer) = nullptr;
+    void  (*Renderer_set_enabled)(void* rend, bool enabled) = nullptr;
     void  (*Transform_get_position_Injected)(void* tr, Vec3* outPos) = nullptr;
     void  (*Transform_set_position_Injected)(void* tr, const Vec3* pos) = nullptr;
     void  (*Transform_get_rotation_Injected)(void* tr, Quat* outRot) = nullptr;
@@ -870,6 +875,8 @@ inline void ResolveUnityIcalls() {
     if (!Init() || !g_api.resolve_icall) return;
     ResolveOneIcall(g_icall.Camera_get_main,                     "UnityEngine.Camera::get_main");
     ResolveOneIcall(g_icall.Camera_WorldToViewportPoint_Injected,"UnityEngine.Camera::WorldToViewportPoint_Injected");
+    ResolveOneIcall(g_icall.Camera_get_worldToCameraMatrix_Injected, "UnityEngine.Camera::get_worldToCameraMatrix_Injected");
+    ResolveOneIcall(g_icall.Camera_get_projectionMatrix_Injected,    "UnityEngine.Camera::get_projectionMatrix_Injected");
     ResolveOneIcall(g_icall.Camera_get_fov,                      "UnityEngine.Camera::get_fieldOfView");
     ResolveOneIcall(g_icall.Camera_set_fov,                      "UnityEngine.Camera::set_fieldOfView");
     ResolveOneIcall(g_icall.Camera_get_aspect,                   "UnityEngine.Camera::get_aspect");
@@ -877,6 +884,9 @@ inline void ResolveUnityIcalls() {
     ResolveOneIcall(g_icall.Comp_get_transform,                  "UnityEngine.Component::get_transform");
     ResolveOneIcall(g_icall.Comp_get_gameObject,                 "UnityEngine.Component::get_gameObject");
     ResolveOneIcall(g_icall.GameObject_SetActive,                "UnityEngine.GameObject::SetActive");
+    ResolveOneIcall(g_icall.GameObject_CreatePrimitive,          "UnityEngine.GameObject::CreatePrimitive");
+    ResolveOneIcall(g_icall.GameObject_set_layer,                "UnityEngine.GameObject::set_layer");
+    ResolveOneIcall(g_icall.Renderer_set_enabled,                "UnityEngine.Renderer::set_enabled");
     ResolveOneIcall(g_icall.Transform_get_position_Injected,     "UnityEngine.Transform::get_position_Injected");
     ResolveOneIcall(g_icall.Transform_set_position_Injected,     "UnityEngine.Transform::set_position_Injected");
     ResolveOneIcall(g_icall.Transform_get_rotation_Injected,     "UnityEngine.Transform::get_rotation_Injected");
@@ -946,6 +956,10 @@ struct UnitySlots {
     void* Comp_get_transform = nullptr;
     void* Comp_get_gameObject = nullptr;
     void* GameObject_SetActive = nullptr;
+    void* GameObject_CreatePrimitive = nullptr;
+    void* GameObject_GetComponentByName = nullptr;
+    void* GameObject_set_layer = nullptr;
+    void* Renderer_set_enabled = nullptr;
     void* Transform_get_position = nullptr;
     void* Transform_set_position = nullptr;
     void* Transform_get_forward = nullptr;
@@ -1029,6 +1043,10 @@ inline void ResolveUnityAndGameMethods() {
     g_unity.Comp_get_transform             = ResolveMethod(u, "Component", "get_transform", 0);
     g_unity.Comp_get_gameObject            = ResolveMethod(u, "Component", "get_gameObject", 0);
     g_unity.GameObject_SetActive           = ResolveMethod(u, "GameObject", "SetActive", 1);
+    g_unity.GameObject_CreatePrimitive     = ResolveMethod(u, "GameObject", "CreatePrimitive", 1);
+    g_unity.GameObject_GetComponentByName  = ResolveMethod(u, "GameObject", "GetComponentByName", 1);
+    g_unity.GameObject_set_layer           = ResolveMethod(u, "GameObject", "set_layer", 1);
+    g_unity.Renderer_set_enabled           = ResolveMethod(u, "Renderer", "set_enabled", 1);
     g_unity.Transform_get_position         = ResolveMethod(u, "Transform", "get_position", 0);
     g_unity.Transform_set_position         = ResolveMethod(u, "Transform", "set_position", 1);
     g_unity.Transform_get_forward          = ResolveMethod(u, "Transform", "get_forward", 0);
@@ -1297,6 +1315,109 @@ inline bool SafeWorldToViewport(void* cam, const Vec3& world, float screenW, flo
     out.x = vp.x * screenW;
     out.y = (1.0f - vp.y) * screenH;
     return std::isfinite(out.x) && std::isfinite(out.y);
+}
+
+struct FrameCameraVP {
+    float vp[16]{};
+    bool  valid = false;
+};
+
+// Reads Camera worldToCameraMatrix & projectionMatrix ONCE per frame (zero GC!) and computes VP = P * V
+inline FrameCameraVP BuildFrameCameraVP(void* cam) {
+    FrameCameraVP out{};
+    if (!IsCameraAlive(cam)) return out;
+    float v[16]{}, p[16]{};
+    bool ok = false;
+    if (g_icall.Camera_get_worldToCameraMatrix_Injected && g_icall.Camera_get_projectionMatrix_Injected) {
+        ok = TCFlyGuard::TryRun([&]() {
+            g_icall.Camera_get_worldToCameraMatrix_Injected(cam, v);
+            g_icall.Camera_get_projectionMatrix_Injected(cam, p);
+        });
+    } else if (g_unity.Camera_get_worldToCameraMatrix && g_unity.Camera_get_projectionMatrix) {
+        void* vUnb = Unbox(SafeInvoke(g_unity.Camera_get_worldToCameraMatrix, cam, nullptr));
+        void* pUnb = Unbox(SafeInvoke(g_unity.Camera_get_projectionMatrix, cam, nullptr));
+        if (vUnb && pUnb && SafeMem::Read(vUnb, v, sizeof(v)) && SafeMem::Read(pUnb, p, sizeof(p))) ok = true;
+    }
+    if (!ok) return out;
+    // Unity Matrix4x4 is column-major: m[col*4 + row]
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = p[0 * 4 + row] * v[col * 4 + 0]
+                      + p[1 * 4 + row] * v[col * 4 + 1]
+                      + p[2 * 4 + row] * v[col * 4 + 2]
+                      + p[3 * 4 + row] * v[col * 4 + 3];
+            if (!std::isfinite(sum)) return out;
+            out.vp[col * 4 + row] = sum;
+        }
+    }
+    out.valid = true;
+    return out;
+}
+
+// Pure C++ zero-icall projection using cached FrameCameraVP (falls back to SafeWorldToViewport if unavailable)
+inline bool ProjectWorldToScreenFast(const FrameCameraVP& fvp, void* cam, const Vec3& world, float screenW, float screenH, Vec2& out) {
+    if (!IsFiniteVec3(world)) return false;
+    if (fvp.valid) {
+        const float* m = fvp.vp;
+        float cx = m[0] * world.x + m[4] * world.y + m[8]  * world.z + m[12];
+        float cy = m[1] * world.x + m[5] * world.y + m[9]  * world.z + m[13];
+        float cw = m[3] * world.x + m[7] * world.y + m[11] * world.z + m[15];
+        if (cw <= 0.05f || !std::isfinite(cw)) return false;
+        float invW = 1.0f / cw;
+        float ndcX = cx * invW;
+        float ndcY = cy * invW;
+        out.x = (ndcX * 0.5f + 0.5f) * screenW;
+        out.y = (0.5f - ndcY * 0.5f) * screenH;
+        return std::isfinite(out.x) && std::isfinite(out.y);
+    }
+    return SafeWorldToViewport(cam, world, screenW, screenH, out);
+}
+
+inline void* SafeCreateInvisibleSkyFloor(int32_t groundLayer, void*& outTransform) {
+    outTransform = nullptr;
+    void* go = nullptr;
+    int32_t cubeType = 3; // UnityEngine.PrimitiveType.Cube = 3
+    if (g_icall.GameObject_CreatePrimitive) {
+        TCFlyGuard::TryRun([&]() { go = g_icall.GameObject_CreatePrimitive(cubeType); });
+    } else if (g_unity.GameObject_CreatePrimitive) {
+        void* a[1] = { &cubeType };
+        go = SafeInvoke(g_unity.GameObject_CreatePrimitive, nullptr, a);
+    }
+    if (!IsGameObjectAlive(go)) return nullptr;
+
+    // Set layer to solid ground layer so CharacterActor walks on it naturally
+    if (groundLayer >= 0 && groundLayer < 32) {
+        if (g_icall.GameObject_set_layer) {
+            TCFlyGuard::TryRun([&]() { g_icall.GameObject_set_layer(go, groundLayer); });
+        } else if (g_unity.GameObject_set_layer) {
+            void* a[1] = { &groundLayer };
+            SafeInvoke(g_unity.GameObject_set_layer, go, a);
+        }
+    }
+
+    // Hide MeshRenderer so the sky floor is 100% invisible while its BoxCollider remains solid!
+    if (g_unity.GameObject_GetComponentByName && g_api.string_new) {
+        void* nameStr = g_api.string_new("MeshRenderer");
+        if (SafeMem::IsPlausiblePtr(nameStr)) {
+            void* a[1] = { nameStr };
+            void* rend = SafeInvoke(g_unity.GameObject_GetComponentByName, go, a);
+            if (IsUnityNativeAlive(rend)) {
+                bool off = false;
+                if (g_icall.Renderer_set_enabled) {
+                    TCFlyGuard::TryRun([&]() { g_icall.Renderer_set_enabled(rend, false); });
+                } else if (g_unity.Renderer_set_enabled) {
+                    void* ra[1] = { &off };
+                    SafeInvoke(g_unity.Renderer_set_enabled, rend, ra);
+                }
+            }
+        }
+    }
+
+    outTransform = SafeGetTransform(go);
+    if (IsTransformAlive(outTransform)) {
+        SafeSetTransformScale(outTransform, { 16.0f, 0.40f, 16.0f });
+    }
+    return go;
 }
 
 inline bool SafeGetRbVelocity(void* rb, Vec3& outVel) {

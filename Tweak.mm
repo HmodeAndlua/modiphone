@@ -59,10 +59,15 @@ static OneStateGlassOverlay* g_overlay = nil;
 
 @implementation ImGuiTouchSinkView {
     CGPoint _touchPos;
+    CGPoint _touchStartPos;
+    CGPoint _prevTouchPos;
     BOOL    _hasTouchPos;
     BOOL    _touchDown;
     BOOL    _latchedDown;
     BOOL    _latchedUp;
+    BOOL    _isSwipeScrolling;
+    float   _pendingWheelY;
+    float   _scrollInertiaY;
 }
 - (void)flushToImGui {
     ImGuiIO& io = ImGui::GetIO();
@@ -70,8 +75,30 @@ static OneStateGlassOverlay* g_overlay = nil;
     if (_hasTouchPos) {
         io.AddMousePosEvent((float)_touchPos.x, (float)_touchPos.y);
     }
+
+    // Native iPhone vertical touch-swipe scrolling + smooth momentum inertia
+    float wheelToSend = 0.0f;
+    if (std::fabs(_pendingWheelY) > 0.001f) {
+        wheelToSend = _pendingWheelY;
+        _pendingWheelY = 0.0f;
+    } else if (!_touchDown && std::fabs(_scrollInertiaY) > 0.015f) {
+        wheelToSend = _scrollInertiaY;
+        _scrollInertiaY *= 0.86f;
+        if (std::fabs(_scrollInertiaY) <= 0.015f) _scrollInertiaY = 0.0f;
+    }
+    if (std::fabs(wheelToSend) > 0.001f) {
+        io.AddMouseWheelEvent(0.0f, wheelToSend);
+    }
+
+    if (_isSwipeScrolling) {
+        // Never trigger accidental toggle taps while finger is scrolling the list
+        io.AddMouseButtonEvent(0, false);
+        _latchedDown = NO;
+        _latchedUp = NO;
+        return;
+    }
+
     if (_latchedDown) {
-        // Guarantee a quick tap is always visible to ImGui for at least 1 full frame
         io.AddMouseButtonEvent(0, true);
         _latchedDown = NO;
     } else if (_latchedUp) {
@@ -84,18 +111,41 @@ static OneStateGlassOverlay* g_overlay = nil;
 - (void)touchesBegan:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
-    _touchPos = [touch locationInView:self];
+    CGPoint p = [touch locationInView:self];
+    _touchPos = p;
+    _touchStartPos = p;
+    _prevTouchPos = p;
     _hasTouchPos = YES;
     _touchDown = YES;
     _latchedDown = YES;
     _latchedUp = NO;
+    _isSwipeScrolling = NO;
+    _pendingWheelY = 0.0f;
+    _scrollInertiaY = 0.0f;
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
-    _touchPos = [touch locationInView:self];
+    CGPoint p = [touch locationInView:self];
+    CGFloat stepDy = p.y - _prevTouchPos.y;
+    CGFloat totalDx = p.x - _touchStartPos.x;
+    CGFloat totalDy = p.y - _touchStartPos.y;
+    _prevTouchPos = p;
+    _touchPos = p;
     _hasTouchPos = YES;
     _touchDown = YES;
+
+    // Detect intentional vertical finger swipe -> smooth native iOS scrolling (never steals horizontal sliders!)
+    if (!ThemeEngine::g_sliderDragging) {
+        if (!_isSwipeScrolling && std::fabs((double)totalDy) > 9.0 && std::fabs((double)totalDy) > std::fabs((double)totalDx) * 1.15) {
+            _isSwipeScrolling = YES;
+        }
+        if (_isSwipeScrolling) {
+            float wheelStep = static_cast<float>(stepDy) * 0.085f;
+            _pendingWheelY += wheelStep;
+            _scrollInertiaY = _scrollInertiaY * 0.55f + wheelStep * 0.45f;
+        }
+    }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
@@ -104,10 +154,16 @@ static OneStateGlassOverlay* g_overlay = nil;
         _hasTouchPos = YES;
     }
     _touchDown = NO;
-    _latchedUp = YES;
+    if (_isSwipeScrolling) {
+        _isSwipeScrolling = NO;
+        _latchedUp = NO;
+    } else {
+        _latchedUp = YES;
+    }
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     _touchDown = NO;
+    _isSwipeScrolling = NO;
     _latchedUp = YES;
 }
 @end
@@ -448,6 +504,7 @@ static OneStateGlassOverlay* g_overlay = nil;
 
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
+    ThemeEngine::g_sliderDragging = false;
 
     if (isAuthed && AuthSystem::IsVerifiedFast()) {
         Features::DrawOverlayVisuals(ImGui::GetBackgroundDrawList(), (float)pts.width, (float)pts.height);
@@ -916,12 +973,12 @@ static OneStateGlassOverlay* g_overlay = nil;
     // ========================================================================
     else if (self.activeTab == 2) {
         if (curSub == 0) {
-            ThemeEngine::ProToggle(T("Player Skywalk (Game Controls)", "مشي اللاعب بالسماء (بأزرار اللعبة)"), &g_cfgState.bFlyHack);
+            ThemeEngine::ProToggle(T("Player Skywalk (Invisible Sky Floor)", "مشي اللاعب بالسماء (أرضية مخفية)"), &g_cfgState.bFlyHack);
             if (g_cfgState.bFlyHack) {
-                ImGui::TextDisabled("%s", T("Move stick + Camera pitch to climb/descend • Jump=Up • Crouch=Down • Sprint=Boost",
-                                            "تحكم بعصا اللعبة واتجاه الكاميرا للصعود/النزول • قفز=أعلى • انحناء=أسفل"));
+                ImGui::TextDisabled("%s", T("Walk, aim & shoot normally! Jump=Climb • Crouch=Descend • Look up/down=Slope",
+                                            "امشِ وصوّب وأطلق النار طبيعياً! قفز=صعود • انحناء=نزول • النظر أعلى/أسفل=ميلان"));
             }
-            ThemeEngine::ProSlider(T("Skywalk Speed", "سرعة المشي بالسماء"), &g_cfgState.flySpeed, 2.0f, 80.0f, "%.1f m/s");
+            ThemeEngine::ProSlider(T("Skywalk Climb Speed", "سرعة الصعود والنزول"), &g_cfgState.flySpeed, 2.0f, 40.0f, "%.1f m/s");
             ImGui::Spacing();
             ThemeEngine::ProToggle(T("Super Jump", "القفز الخارق"), &g_cfgState.bSuperJump);
             ThemeEngine::ProSlider(T("Jump Force", "قوة القفز"), &g_cfgState.superJumpForce, 5.0f, 50.0f, "%.1f");
