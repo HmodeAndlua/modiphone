@@ -1205,12 +1205,12 @@ inline void DrawPanel(float availW) {
         }
     }
 
+    int32_t selPid = g_kaSelectedPlayerId.load(std::memory_order_relaxed);
     ImGui::BeginChild("##ka_list", ImVec2(0.0f, 168.0f), true);
     if (s_visibleIdx.empty()) {
         ImGui::TextDisabled("%s", T("No players in list — stand near players or turn off Nearby filter.",
                                     "لا يوجد لاعبون الآن — اقترب أو أوقف فلتر القريبين."));
     } else {
-        int32_t selPid = g_kaSelectedPlayerId.load(std::memory_order_relaxed);
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(s_visibleIdx.size()), 28.0f);
         while (clipper.Step()) {
