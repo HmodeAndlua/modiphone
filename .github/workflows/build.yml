@@ -1,0 +1,45 @@
+name: Build OneStateFull DEB & Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install ldid dpkg xz
+
+      - name: Setup Theos & Dear ImGui
+        run: |
+          [ -f Makefile ] || cd OneStateFull
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/sdks"
+          ln -s "$(xcrun --sdk iphoneos --show-sdk-path)" "$HOME/theos/sdks/iPhoneOS.sdk"
+
+          git clone --depth=1 --branch v1.91.8 https://github.com/ocornut/imgui.git "$HOME/imgui_upstream"
+          mkdir -p imgui
+          cp "$HOME/imgui_upstream"/*.h "$HOME/imgui_upstream"/*.cpp imgui/
+          cp "$HOME/imgui_upstream/backends/imgui_impl_metal.h" imgui/
+          cp "$HOME/imgui_upstream/backends/imgui_impl_metal.mm" imgui/
+
+      - name: Build OneStateFull Dylib & DEB
+        run: |
+          [ -f Makefile ] || cd OneStateFull
+          export THEOS="$HOME/theos"
+          make package FINALPACKAGE=1
+          mkdir -p out_artifacts
+          cp packages/*.deb out_artifacts/
+          (cp .theos/obj/arm64/OneStateFull.dylib out_artifacts/OneStateFull.dylib || cp .theos/obj/OneStateFull.dylib out_artifacts/OneStateFull.dylib)
+          ldid -S out_artifacts/OneStateFull.dylib
+
+      - name: Upload DEB & Dylib artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OneStateFull-Build
+          path: "**/out_artifacts/*"
