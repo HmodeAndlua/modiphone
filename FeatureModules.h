@@ -818,7 +818,7 @@ static void Hook_PedGravityUpdate(void* self, float dt, void* method) {
             }
         }
     }
-    if (IsGhostProtectedNow()) return;
+    if (IsGhostProtectedNow() || (!g_cfgState.bMasterDisable && g_cfgState.bFlyHack)) return;
     if (orig_PedGravityUpdate) orig_PedGravityUpdate(self, dt, method);
 }
 
@@ -1046,8 +1046,8 @@ inline void InstallLazyFeatureHooks() {
     if (!g_hooksInstalled || !Il2Cpp::Init()) return;
     const auto& c = Offsets::g_cfg;
 
-    if (g_cfgState.bFreeCam || g_cfgState.bSpectateActive || g_cfgState.bTalkFreeCam) {
-        if (!g_freeCamPatchesInstalled) EnsureFreeCamSystemPatches();
+    if (g_cfgState.bFreeCam || g_cfgState.bSpectateActive || g_cfgState.bTalkFreeCam || g_cfgState.bFlyHack) {
+        if (!g_freeCamPatchesInstalled && (g_cfgState.bFreeCam || g_cfgState.bSpectateActive || g_cfgState.bTalkFreeCam)) EnsureFreeCamSystemPatches();
         if (!g_freeCamVoiceHooksInstalled) EnsureFreeCamVoiceAndImmunityHooks();
     }
 
@@ -1799,13 +1799,13 @@ inline void TickMovementMods(float dt) {
     }
 
     // =========================================================================
-    // Real Invisible-Floor Skywalk (Ped walks/aims/shoots 100% normally on a
-    // solid invisible sky platform!) + Smooth Game-Controlled Car Fly
+    // Crash-Free Grounded Y-Floor Skywalk (ZERO CreatePrimitive / ZERO ForceNotGrounded!
+    // Keeps CharacterActor grounded & active so walking, aiming & shooting work 100%
+    // normally while locking ONLY vertical Y altitude) + Game-Controlled Car Fly
     // =========================================================================
     static bool  s_skyFloorActive = false;
-    static void* s_skyFloorGo     = nullptr;
-    static void* s_skyFloorTr     = nullptr;
     static float s_skyFloorY      = 0.0f;
+    static void* s_skyFloorRb     = nullptr;
 
     static bool  s_carFlyActive = false;
     static Vec3  s_carFlyPos{};
@@ -1909,12 +1909,14 @@ inline void TickMovementMods(float dt) {
 
     auto disableSkyFloor = [&]() {
         if (!s_skyFloorActive) return;
-        if (s_skyFloorGo && Il2Cpp::IsGameObjectAlive(s_skyFloorGo)) {
-            Il2Cpp::SafeSetGameObjectActive(s_skyFloorGo, false);
+        if (s_skyFloorRb && Il2Cpp::IsRigidbodyAlive(s_skyFloorRb)) {
+            Il2Cpp::SafeSetRbGravity(s_skyFloorRb, true);
+            Il2Cpp::SafeSetRbKinematic(s_skyFloorRb, false);
         }
         // Grant brief fall-damage grace when stepping off the sky floor
         Hooks::g_fcReturnGraceUntil.store(CACurrentMediaTime() + 3.5, std::memory_order_release);
         s_skyFloorActive = false;
+        s_skyFloorRb = nullptr;
     };
 
     auto restoreCarFlyPhysics = [&]() {
@@ -2006,66 +2008,80 @@ inline void TickMovementMods(float dt) {
                 }
             }
         }
-        // --- TRUE INVISIBLE-FLOOR SKYWALK (Player stands/walks/aims/shoots 100% normally in the sky!) ---
+        // --- CRASH-FREE GROUNDED Y-FLOOR SKYWALK (Zero CreatePrimitive, normal walk/aim/shoot!) ---
         else if (pedFly && tr && Il2Cpp::IsTransformAlive(tr)) {
             Vec3 footPos{};
             if (ReadTransformPosition(tr, footPos) && IsFiniteVec3(footPos)) {
-                // Lazily spawn or reactivate the invisible solid sky floor collider
-                if (!s_skyFloorGo || !Il2Cpp::IsGameObjectAlive(s_skyFloorGo) || !Il2Cpp::IsTransformAlive(s_skyFloorTr)) {
-                    int32_t groundLayer = 0;
-                    uint32_t gMask = static_cast<uint32_t>(Hooks::g_groundLayerMask.load(std::memory_order_acquire));
-                    if (gMask != 0 && gMask != 0xFFFFFFFFU) {
-                        for (int bit = 0; bit < 32; ++bit) {
-                            if (gMask & (1u << bit)) { groundLayer = bit; break; }
-                        }
-                    }
-                    s_skyFloorGo = Il2Cpp::SafeCreateInvisibleSkyFloor(groundLayer, s_skyFloorTr);
-                }
-
                 if (!s_skyFloorActive) {
-                    s_skyFloorY = footPos.y - 0.02f;
-                    if (s_skyFloorGo && Il2Cpp::IsGameObjectAlive(s_skyFloorGo)) {
-                        Il2Cpp::SafeSetGameObjectActive(s_skyFloorGo, true);
-                    }
+                    s_skyFloorY = footPos.y;
+                    s_skyFloorRb = rb;
                     s_skyFloorActive = true;
                 }
+                s_skyFloorRb = rb;
 
                 float climbRate = std::clamp(g_cfgState.flySpeed * 0.45f, 2.0f, 18.0f);
                 if (gi.jump) {
-                    // Holding Jump smoothly lifts the invisible sky floor upward!
                     s_skyFloorY += climbRate * dt;
                 } else if (gi.crouch) {
-                    // Holding Crouch smoothly lowers the invisible sky floor downward!
                     s_skyFloorY -= climbRate * dt;
                 } else if (std::fabs(gi.pedV) > 0.15f && std::fabs(fwd.y) > 0.24f) {
-                    // Walking while looking clearly up or down slopes the sky floor smoothly like invisible stairs!
-                    s_skyFloorY += fwd.y * gi.pedV * climbRate * 0.80f * dt;
+                    s_skyFloorY += fwd.y * gi.pedV * climbRate * 0.85f * dt;
                 }
 
-                // If the player naturally jumped higher than the sky floor, raise the floor to catch them at the peak!
-                if (footPos.y > s_skyFloorY + 0.35f && footPos.y < s_skyFloorY + 3.2f) {
-                    s_skyFloorY = footPos.y - 0.05f;
-                }
-                // Safety net: never allow the player to fall below their own sky floor!
-                if (footPos.y < s_skyFloorY - 0.55f) {
-                    s_skyFloorY = footPos.y - 0.03f;
+                // Cancel ONLY vertical gravity/fall speed while preserving 100% of natural X/Z walking & combat!
+                if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
+                    Il2Cpp::SafeSetRbGravity(rb, false);
+                    Il2Cpp::SafeSetRbKinematic(rb, false);
+                    Vec3 curVel{};
+                    if (Il2Cpp::SafeGetRbVelocity(rb, curVel) && std::fabs(curVel.y) > 0.001f) {
+                        Il2Cpp::SafeSetRbVelocity(rb, { curVel.x, 0.0f, curVel.z });
+                    }
                 }
 
-                // Slide the 16x0.4x16 invisible solid floor directly beneath the player's feet (top surface = s_skyFloorY)
-                if (s_skyFloorTr && Il2Cpp::IsTransformAlive(s_skyFloorTr)) {
-                    Vec3 floorCenter{ footPos.x, s_skyFloorY - 0.20f, footPos.z };
-                    Il2Cpp::SafeSetTransformPos(s_skyFloorTr, floorCenter);
+                const auto& cfg = Offsets::g_cfg;
+                if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
+                    Il2Cpp::SafeSetBehaviourEnabled(actor, true);
+                    if (Il2Cpp::g_unity.mPhysActor_SetVertVel) {
+                        Vec3 zeroV{ 0.0f, 0.0f, 0.0f };
+                        void* va[1] = { &zeroV };
+                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetVertVel, actor, va);
+                    }
+                    // Keep CharacterActor grounded & stable (dump1.4.1.cpp L1340160..L1340185) so PedStateMachine
+                    // stays in normal standing/walking state (weapons, aiming, shooting & reloading all work!)
+                    uint8_t* ab = reinterpret_cast<uint8_t*>(actor);
+                    uint8_t one = 1, zeroB = 0;
+                    float oneF = 1.0f, zeroF = 0.0f;
+                    SafeMem::Write(ab + cfg.offCharActorGrounded, &one, 1);     // 0x1A0 IsGrounded
+                    SafeMem::Write(ab + cfg.offCharActorStable,   &one, 1);     // 0x1A1 IsStable
+                    SafeMem::Write(ab + 0x1A2, &one, 1);                        // 0x1A2 WasGrounded
+                    SafeMem::Write(ab + 0x1A3, &one, 1);                        // 0x1A3 WasStable
+                    SafeMem::Write(ab + 0x1A6, &zeroB, 1);                      // 0x1A6 HasBecomeNotGrounded
+                    SafeMem::Write(ab + 0x1A7, &zeroB, 1);                      // 0x1A7 HasBecomeUnstable
+                    SafeMem::Write(ab + 0x208, &oneF, sizeof(float));           // 0x208 GroundedTime
+                    SafeMem::Write(ab + 0x20C, &zeroF, sizeof(float));          // 0x20C NotGroundedTime
+                    SafeMem::Write(ab + 0x210, &oneF, sizeof(float));           // 0x210 StableElapsedTime
+
+                    // Zero ONLY Y component of internal velocities & clamp Y of start/target interpolation positions
+                    SafeMem::Write(ab + cfg.offCharActorPreVel  + 4, &zeroF, sizeof(float));
+                    SafeMem::Write(ab + cfg.offCharActorPostVel + 4, &zeroF, sizeof(float));
+                    SafeMem::Write(ab + cfg.offCharActorExtVel  + 4, &zeroF, sizeof(float));
+                    SafeMem::Write(ab + cfg.offPhysActorStartPos  + 4, &s_skyFloorY, sizeof(float));
+                    SafeMem::Write(ab + cfg.offPhysActorTargetPos + 4, &s_skyFloorY, sizeof(float));
+                }
+
+                // Clamp ONLY Y altitude while preserving X/Z untouched from the game's own walking controller!
+                Vec3 clampedPos{ footPos.x, s_skyFloorY, footPos.z };
+                if (std::fabs(footPos.y - s_skyFloorY) > 0.005f) {
+                    Il2Cpp::SafeSetTransformPos(tr, clampedPos);
+                    if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
+                        Il2Cpp::SafeSetRbPosition(rb, clampedPos);
+                    }
                     Il2Cpp::SafePhysicsSyncTransforms();
                 }
-
-                // If player is rising via Jump hold and still below new floor top, lift feet smoothly onto floor top
-                if (gi.jump && footPos.y < s_skyFloorY - 0.02f) {
-                    Vec3 lifted{ footPos.x, s_skyFloorY + 0.02f, footPos.z };
-                    if (actor && Il2Cpp::IsUnityNativeAlive(actor) && Il2Cpp::g_unity.mPhysActor_SetPos) {
-                        void* a[1] = { &lifted };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetPos, actor, a);
-                    } else {
-                        Il2Cpp::SafeSetTransformPos(tr, lifted);
+                int32_t pedId = Morpeh::UnpackEntityId(ped);
+                if (pedId >= 0) {
+                    if (void* posPtr = Morpeh::Get(Morpeh::g_stashes.positionStash, pedId, sizeof(Vec3))) {
+                        SafeMem::Write(posPtr, &clampedPos, sizeof(Vec3));
                     }
                 }
             }

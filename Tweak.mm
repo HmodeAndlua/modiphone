@@ -171,6 +171,7 @@ static OneStateGlassOverlay* g_overlay = nil;
 @implementation OneStateGlassOverlay {
     char _searchBuf[64];
     char _playerSearchBuf[64];
+    char _freeCamSearchBuf[64];
     int  _subTabs[5];
     BOOL _overlayWasDrawn;
 }
@@ -184,6 +185,7 @@ static OneStateGlassOverlay* g_overlay = nil;
         _previewPose = 0;
         _searchBuf[0] = '\0';
         _playerSearchBuf[0] = '\0';
+        _freeCamSearchBuf[0] = '\0';
         _overlayWasDrawn = YES;
     }
     return self;
@@ -866,36 +868,43 @@ static OneStateGlassOverlay* g_overlay = nil;
 
             int fcSrch = ThemeEngine::SearchPillButton("##fc_pl_search",
                                                        T("Tap to search player name or ID...", "اضغط للبحث بالاسم أو الأيدي..."),
-                                                       _playerSearchBuf);
+                                                       _freeCamSearchBuf);
             if (fcSrch == 1) {
                 bool ar = Lang::IsArabic();
-                [self promptNativeInputWithTitle:(ar ? @"بحث عن لاعب" : @"Search Players")
+                [self promptNativeInputWithTitle:(ar ? @"بحث عن لاعب للمراقبة" : @"Search Player to Spectate")
                                      placeholder:(ar ? @"اكتب اسم اللاعب أو الأيدي..." : @"Enter player name or ID...")
-                                         initial:[NSString stringWithUTF8String:_playerSearchBuf]
+                                         initial:[NSString stringWithUTF8String:_freeCamSearchBuf]
                                          numeric:NO
                                         onSubmit:^(NSString* text) {
                     const char* utf = text ? text.UTF8String : "";
-                    std::snprintf(_playerSearchBuf, sizeof(_playerSearchBuf), "%s", utf ? utf : "");
+                    std::snprintf(_freeCamSearchBuf, sizeof(_freeCamSearchBuf), "%s", utf ? utf : "");
                 }];
             } else if (fcSrch == 2) {
-                _playerSearchBuf[0] = '\0';
+                _freeCamSearchBuf[0] = '\0';
             }
             ImGui::Spacing();
 
-            if (serverList.empty()) {
-                ImGui::TextDisabled("%s", T("Scanning server players... join world to see everyone (near & far).",
-                                            "جاري مسح لاعبي السيرفر... ادخل العالم لعرض الجميع (القريب والبعيد)."));
+            // Hide all player names by default in FreeCam — show matching results ONLY when searching!
+            if (_freeCamSearchBuf[0] == '\0') {
+                ImGui::TextDisabled("%s", T("Search by player name or ID above to show matching results.",
+                                            "ابحث بالاسم أو الأيدي أعلاه لإظهار اللاعبين المطابقين فقط."));
+            } else if (serverList.empty()) {
+                ImGui::TextDisabled("%s", T("Scanning server players... join world first.",
+                                            "جاري مسح لاعبي السيرفر... ادخل العالم أولاً."));
             } else {
                 ImGui::BeginChild("##spec_list", ImVec2(0, 0), true);
+                int matchCount = 0;
                 for (const auto& sp : serverList) {
-                    if (_playerSearchBuf[0] != '\0') {
-                        char idStr[32];
-                        snprintf(idStr, sizeof(idStr), "%u", sp.digitalId);
-                        if (!ThemeEngine::CaseInsensitiveContains(sp.name.c_str(), _playerSearchBuf) &&
-                            !ThemeEngine::CaseInsensitiveContains(idStr, _playerSearchBuf)) {
-                            continue;
-                        }
+                    char idStr[32];
+                    char pidStr[32];
+                    snprintf(idStr, sizeof(idStr), "%u", sp.digitalId);
+                    snprintf(pidStr, sizeof(pidStr), "%d", sp.playerId);
+                    if (!ThemeEngine::CaseInsensitiveContains(sp.name.c_str(), _freeCamSearchBuf) &&
+                        !ThemeEngine::CaseInsensitiveContains(idStr, _freeCamSearchBuf) &&
+                        !ThemeEngine::CaseInsensitiveContains(pidStr, _freeCamSearchBuf)) {
+                        continue;
                     }
+                    ++matchCount;
                     ImGui::PushID(sp.playerId);
                     bool isCur = (g_cfgState.bSpectateActive && sp.pedEntityVal > 0 &&
                                   g_cfgState.spectateTargetPedEnt == sp.pedEntityVal);
@@ -925,6 +934,9 @@ static OneStateGlassOverlay* g_overlay = nil;
                         }
                     }
                     ImGui::PopID();
+                }
+                if (matchCount == 0) {
+                    ImGui::TextDisabled("%s", T("No matching player found.", "لم يتم العثور على لاعب مطابق."));
                 }
                 ImGui::EndChild();
             }
@@ -973,9 +985,9 @@ static OneStateGlassOverlay* g_overlay = nil;
     // ========================================================================
     else if (self.activeTab == 2) {
         if (curSub == 0) {
-            ThemeEngine::ProToggle(T("Player Skywalk (Invisible Sky Floor)", "مشي اللاعب بالسماء (أرضية مخفية)"), &g_cfgState.bFlyHack);
+            ThemeEngine::ProToggle(T("Player Skywalk (Grounded Y-Lock)", "مشي اللاعب بالسماء (بدون كراش)"), &g_cfgState.bFlyHack);
             if (g_cfgState.bFlyHack) {
-                ImGui::TextDisabled("%s", T("Walk, aim & shoot normally! Jump=Climb • Crouch=Descend • Look up/down=Slope",
+                ImGui::TextDisabled("%s", T("Walk, aim & shoot normally! Jump=Rise • Crouch=Descend • Look up/down=Slope",
                                             "امشِ وصوّب وأطلق النار طبيعياً! قفز=صعود • انحناء=نزول • النظر أعلى/أسفل=ميلان"));
             }
             ThemeEngine::ProSlider(T("Skywalk Climb Speed", "سرعة الصعود والنزول"), &g_cfgState.flySpeed, 2.0f, 40.0f, "%.1f m/s");
