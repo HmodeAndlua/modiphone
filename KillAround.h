@@ -137,6 +137,7 @@ struct NamedTargetCandidate {
     int32_t     hp = 100;
     bool        hasPos = false;
     bool        isNpc = false;
+    bool        isDead = false;
 };
 
 struct SentHitRecord {
@@ -462,11 +463,22 @@ inline bool IsTargetConfirmedDead(int32_t elemId, int32_t playerId) {
 
 inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
     std::vector<NamedTargetCandidate> out;
+    int64_t nowMs = GetMonotonicMs();
     Vec3 myPos{};
-    bool hasMyPos = GetLocalPlayerPos(myPos);
+    bool hasMyPos = false;
     int32_t myElemId = g_kaLocalElemId.load(std::memory_order_relaxed);
     int64_t localPed = Morpeh::GetLocalPedEntity();
     int32_t localPedId = (localPed > 0) ? Morpeh::UnpackEntityId(localPed) : -1;
+    // Fast zero-icall local position read from Morpeh positionStash (avoids Transform icall stutter in UI)
+    if (localPedId >= 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.positionStash)) {
+        if (void* p = Morpeh::Get(Morpeh::g_stashes.positionStash, localPedId, sizeof(Vec3))) {
+            if (SafeMem::ReadVal(p, myPos) && IsFiniteVec3(myPos) &&
+                (std::fabs(myPos.x) > 0.25f || std::fabs(myPos.z) > 0.25f)) {
+                hasMyPos = true;
+            }
+        }
+    }
+    if (!hasMyPos) hasMyPos = GetLocalPlayerPos(myPos);
 
     std::vector<ServerPlayerEntry> srvSnap;
     std::vector<ESPPlayer> renderSnap;
@@ -482,7 +494,9 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         elemSnap = g_kaTracked;
     }
 
+    out.reserve(srvSnap.size() + renderSnap.size());
     std::unordered_set<int32_t> seenPeds;
+    seenPeds.reserve(srvSnap.size() + 16);
     for (const auto& sp : srvSnap) {
         NamedTargetCandidate c{};
         c.playerId  = sp.playerId;
@@ -492,6 +506,7 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         c.hp        = sp.health;
         c.pos       = sp.worldPos;
         c.hasPos    = (sp.isStreamed || (IsFiniteVec3(sp.worldPos) && (std::fabs(sp.worldPos.x) > 0.25f || std::fabs(sp.worldPos.z) > 0.25f)));
+        c.isDead    = (sp.isStreamed && sp.health <= 0);
         if (sp.pedEntityVal > 0) {
             ReadPedElementId(sp.pedEntityVal, c.elemId, c.elemGen);
             if (sp.pedId >= 0) seenPeds.insert(sp.pedId);
@@ -500,12 +515,17 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
 
         if (c.elemId >= 1) {
             auto it = elemSnap.find(c.elemId);
-            if (it != elemSnap.end() && it->second.isPed) {
-                if (!c.hasPos && IsFiniteVec3(it->second.pos) && (std::fabs(it->second.pos.x) > 0.25f || std::fabs(it->second.pos.z) > 0.25f)) {
-                    c.pos = it->second.pos;
-                    c.hasPos = true;
+            if (it != elemSnap.end()) {
+                if (it->second.deadUntilMs > nowMs || (it->second.hp <= 0.0f && (nowMs - it->second.lastSeenMs) < 3000)) {
+                    c.isDead = true;
                 }
-                if (it->second.hp <= 0.0f) c.hp = 0;
+                if (it->second.isPed) {
+                    if (!c.hasPos && IsFiniteVec3(it->second.pos) && (std::fabs(it->second.pos.x) > 0.25f || std::fabs(it->second.pos.z) > 0.25f)) {
+                        c.pos = it->second.pos;
+                        c.hasPos = true;
+                    }
+                    if (it->second.hp <= 0.0f) { c.hp = 0; c.isDead = true; }
+                }
             }
         }
         if (hasMyPos && c.hasPos) c.dist = Vec3Dist(myPos, c.pos);
@@ -531,6 +551,9 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         c.pos      = pl.worldPos;
         c.hasPos   = true;
         c.isNpc    = (pl.playerId < 0);
+        c.isDead   = (pl.dead || pl.health <= 0);
+        auto it = elemSnap.find(eId);
+        if (it != elemSnap.end() && it->second.deadUntilMs > nowMs) c.isDead = true;
         c.dist     = hasMyPos ? Vec3Dist(myPos, pl.worldPos) : 99999.0f;
         out.push_back(std::move(c));
     }
@@ -551,7 +574,7 @@ inline std::vector<NamedTargetCandidate> CollectNearbyAuraTargets(float radiusM,
         if (c.elemId < 1 || (myElemId >= 1 && c.elemId == myElemId)) continue;
         if (!includeNpcs && c.isNpc) continue;
         if (!c.hasPos || c.dist > radiusM) continue;
-        if (c.hp <= 0 || IsTargetConfirmedDead(c.elemId, c.playerId)) continue;
+        if (c.hp <= 0 || c.isDead) continue;
         out.push_back(std::move(c));
     }
     g_kaLastNearbyCount.store(static_cast<int32_t>(out.size()), std::memory_order_relaxed);
@@ -976,15 +999,17 @@ inline void Tick() {
     bool auraActive     = g_cfgState.bKillAroundAura || killAllBurst;
     bool autoFinishWnd  = (nowMs < g_kaAutoFinishUntilMs.load(std::memory_order_acquire));
     bool singleFollowOn = (g_cfgState.bKillAroundAutoRepeat || autoFinishWnd) && (g_kaCurrentTargetId >= 1);
-    bool uiVisible      = g_menuIsOpenAtomic.load(std::memory_order_relaxed);
+    bool kaTabVisible   = g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
+                          g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
+                          g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3;
 
-    if (!auraActive && !singleFollowOn && !g_kaHasActiveGhost && !g_kaStepActive && !g_kaCombatActive && !uiVisible) {
+    if (!auraActive && !singleFollowOn && !g_kaHasActiveGhost && !g_kaStepActive && !g_kaCombatActive && !kaTabVisible) {
         return;
     }
 
     static int64_t s_lastUiNearMs = 0;
     std::vector<NamedTargetCandidate> auraTargets;
-    if (auraActive || (uiVisible && (nowMs - s_lastUiNearMs) >= 220)) {
+    if (auraActive || (kaTabVisible && (nowMs - s_lastUiNearMs) >= 700)) {
         s_lastUiNearMs = nowMs;
         auraTargets = CollectNearbyAuraTargets(g_cfgState.killAroundRadius, g_cfgState.bKillAroundIncludeNpcs);
     }
@@ -1067,7 +1092,8 @@ inline void DrawPanel(float availW) {
     using Lang::T;
     int32_t myId  = g_kaLocalElemId.load(std::memory_order_relaxed);
     int32_t myGen = g_kaLocalElemGen.load(std::memory_order_relaxed);
-    bool hasMcw   = (Morpeh::g_stashes.worldReady && Morpeh::EnsureMetaClientResolved() != nullptr);
+    // Pure pointer check (ZERO IL2CPP reflection / SimpleDImple calls inside UI draw loop!)
+    bool hasMcw   = (Morpeh::g_stashes.worldReady && Il2Cpp::IsUnityObjectSafe(Morpeh::g_stashes.realMetaClient));
     int32_t err   = g_kaLastSendError.load(std::memory_order_relaxed);
     int32_t nearN = g_kaLastNearbyCount.load(std::memory_order_relaxed);
     int32_t sweeps = g_kaAuraSweepCount.load(std::memory_order_relaxed);
@@ -1139,52 +1165,75 @@ inline void DrawPanel(float availW) {
     }
 
     static std::vector<NamedTargetCandidate> s_cached;
+    static std::vector<size_t> s_visibleIdx;
+    static bool s_hasCachedOnce = false;
     static int64_t s_lastUiMs = 0;
+    static std::string s_lastFilterKey;
+    static bool s_lastNearOnly = false;
+    static float s_lastRadius = -1.0f;
+
     int64_t nowUi = GetMonotonicMs();
-    if (s_cached.empty() || (nowUi - s_lastUiMs) >= 180) {
+    bool refreshed = false;
+    if (!s_hasCachedOnce || (nowUi - s_lastUiMs) >= 650) {
+        s_hasCachedOnce = true;
         s_lastUiMs = nowUi;
         s_cached = CollectNamedPlayersSnapshot();
+        refreshed = true;
     }
 
-    std::vector<NamedTargetCandidate> visible;
-    visible.reserve(s_cached.size());
-    for (const auto& c : s_cached) {
-        if (g_cfgState.bKillAroundFilterNear && (!c.hasPos || c.dist > g_cfgState.killAroundRadius)) continue;
-        if (g_kaSearchBuf[0] != '\0') {
-            char pidBuf[24];
-            snprintf(pidBuf, sizeof(pidBuf), "%d", c.playerId);
-            if (!ThemeEngine::CaseInsensitiveContains(c.name.c_str(), g_kaSearchBuf) &&
-                !ThemeEngine::CaseInsensitiveContains(pidBuf, g_kaSearchBuf)) {
-                continue;
+    if (refreshed ||
+        s_lastNearOnly != g_cfgState.bKillAroundFilterNear ||
+        std::fabs(s_lastRadius - g_cfgState.killAroundRadius) > 0.05f ||
+        s_lastFilterKey != g_kaSearchBuf) {
+        s_lastNearOnly = g_cfgState.bKillAroundFilterNear;
+        s_lastRadius   = g_cfgState.killAroundRadius;
+        s_lastFilterKey = g_kaSearchBuf;
+        s_visibleIdx.clear();
+        s_visibleIdx.reserve(s_cached.size());
+        for (size_t i = 0; i < s_cached.size(); ++i) {
+            const auto& c = s_cached[i];
+            if (g_cfgState.bKillAroundFilterNear && (!c.hasPos || c.dist > g_cfgState.killAroundRadius)) continue;
+            if (g_kaSearchBuf[0] != '\0') {
+                char pidBuf[24];
+                snprintf(pidBuf, sizeof(pidBuf), "%d", c.playerId);
+                if (!ThemeEngine::CaseInsensitiveContains(c.name.c_str(), g_kaSearchBuf) &&
+                    !ThemeEngine::CaseInsensitiveContains(pidBuf, g_kaSearchBuf)) {
+                    continue;
+                }
             }
+            s_visibleIdx.push_back(i);
         }
-        visible.push_back(c);
     }
 
     ImGui::BeginChild("##ka_list", ImVec2(0.0f, 168.0f), true);
-    if (visible.empty()) {
+    if (s_visibleIdx.empty()) {
         ImGui::TextDisabled("%s", T("No players in list — stand near players or turn off Nearby filter.",
                                     "لا يوجد لاعبون الآن — اقترب أو أوقف فلتر القريبين."));
-    }
-    int32_t selPid = g_kaSelectedPlayerId.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < visible.size(); ++i) {
-        const auto& c = visible[i];
-        ImGui::PushID(static_cast<int>(i));
-        bool isSel = (selPid != 0 && selPid == c.playerId);
-        bool dead = (c.hp <= 0) || IsTargetConfirmedDead(c.elemId, c.playerId);
-        ImVec4 rowCol = isSel ? ImVec4(1.0f, 0.42f, 0.48f, 1.0f)
-                              : (c.elemId > 0 ? ImVec4(0.94f, 0.96f, 1.0f, 1.0f) : ImVec4(0.70f, 0.72f, 0.78f, 1.0f));
-        if (c.hasPos) ImGui::TextColored(rowCol, "%s [%.1fm]%s", c.name.c_str(), c.dist, dead ? " [DEAD]" : "");
-        else          ImGui::TextColored(rowCol, "%s [#%d]%s", c.name.c_str(), c.playerId, dead ? " [DEAD]" : "");
-        ImGui::SameLine(std::max(190.0f, availW - 104.0f));
-        if (c.elemId >= 1) {
-            if (ImGui::Button(T("KILL##ka_k", "قتل##ka_k"), ImVec2(84.0f, 24.0f))) {
-                RequestKillTarget(c.playerId, c.elemId, c.elemGen, c.name);
+    } else {
+        int32_t selPid = g_kaSelectedPlayerId.load(std::memory_order_relaxed);
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(s_visibleIdx.size()), 28.0f);
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const auto& c = s_cached[s_visibleIdx[static_cast<size_t>(row)]];
+                ImGui::PushID(row);
+                bool isSel = (selPid != 0 && selPid == c.playerId);
+                bool dead = c.isDead || (c.hp <= 0);
+                ImVec4 rowCol = isSel ? ImVec4(1.0f, 0.42f, 0.48f, 1.0f)
+                                      : (c.elemId > 0 ? ImVec4(0.94f, 0.96f, 1.0f, 1.0f) : ImVec4(0.70f, 0.72f, 0.78f, 1.0f));
+                if (c.hasPos) ImGui::TextColored(rowCol, "%s [%.1fm]%s", c.name.c_str(), c.dist, dead ? " [DEAD]" : "");
+                else          ImGui::TextColored(rowCol, "%s [#%d]%s", c.name.c_str(), c.playerId, dead ? " [DEAD]" : "");
+                ImGui::SameLine(std::max(190.0f, availW - 104.0f));
+                if (c.elemId >= 1) {
+                    if (ImGui::Button(T("KILL##ka_k", "قتل##ka_k"), ImVec2(84.0f, 24.0f))) {
+                        RequestKillTarget(c.playerId, c.elemId, c.elemGen, c.name);
+                    }
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+                ImGui::PopID();
             }
-        } else {
-            ImGui::TextDisabled("-");
         }
-        ImGui::PopID();
     }
     ImGui::EndChild();
 

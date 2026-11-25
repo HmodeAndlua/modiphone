@@ -39,6 +39,8 @@ using SpatialCtorFn       = void (*)(void*, void*);
 using VoiceSetMutedFn     = void (*)(void*, int32_t, bool, void*);
 using VoiceSetAllMutedFn  = void (*)(void*, bool, void*);
 using WaterTriggerFn      = void (*)(void*, void*, void*);
+using CharActorSimFn      = void (*)(void*, float, void*);
+using PedStateCanEnterFn  = bool (*)(void*, const void*, int32_t, int32_t, void*);
 
 inline SystemUpdateFn    orig_GZ_Sync = nullptr, orig_GZ_Fire = nullptr, orig_GZ_Melee = nullptr;
 inline FallDmgFn         orig_ApplyLocalFallDamage = nullptr;
@@ -72,6 +74,13 @@ inline SystemUpdateFn      orig_UnderwaterReactUpdate = nullptr;
 inline WaterTriggerFn      orig_WaterAreaTriggerStay = nullptr;
 inline WriteDatagramFn     orig_PedDispRead = nullptr, orig_PedDispWrite = nullptr;
 inline WriteDatagramFn     orig_PedDeadRead = nullptr, orig_MeleeAtkRead = nullptr, orig_MeleeReqWrite = nullptr;
+// LADRRAZAsrc AirWalk (CharacterActor) + Anti-Taser & Anti-Faint (Knockout / LoseConsciousness)
+inline CharActorSimFn      orig_CharActor_PreSim = nullptr, orig_CharActor_PostSim = nullptr;
+inline PedStateCanEnterFn  orig_FallState_CanEnter[7]{};
+inline PedStateCanEnterFn  orig_KoState_CanEnter[5]{};
+inline SystemUpdateFn      orig_WeaponTizerSyncUpdate = nullptr, orig_WeaponTizerTimerUpdate = nullptr;
+inline SystemUpdateFn      orig_PedViewKoSysUpdate = nullptr;
+inline SystemUpdateFn      orig_LoseConscUpdate = nullptr, orig_SkipLoseConscUpdate = nullptr;
 
 inline double g_vehSpawnCaptureDeadline = 0.0;
 inline bool   g_hooksInstalled = false;
@@ -86,6 +95,12 @@ inline bool   g_freeCamPatchesInstalled = false;
 inline bool   g_freeCamVoiceHooksInstalled = false;
 inline bool   g_killAroundHooksInstalled = false;
 inline bool   g_mapHooksInstalled = false;
+inline bool   g_airWalkHooksInstalled = false;
+inline bool   g_antiTaserFaintHooksInstalled = false;
+
+inline std::atomic<void*>   g_localCharacterActor{nullptr};
+inline std::atomic<int32_t> g_localViewIdAtomic{-1};
+inline std::atomic<bool>    g_localInVehicle{false};
 
 // Shared Silent Aim & Wallbang state published per frame by ApplyAimbotStep
 inline std::atomic<bool>     g_silentAimHasTarget{false};
@@ -790,7 +805,7 @@ static void Hook_PedOxygenUpdate(void* self, float dt, void* method) {
     if (orig_PedOxygenUpdate) orig_PedOxygenUpdate(self, dt, method);
 }
 static void Hook_PedKoWaterUpdate(void* self, float dt, void* method) {
-    if (IsGhostProtectedNow()) return;
+    if (IsGhostProtectedNow() || (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint))) return;
     if (orig_PedKoWaterUpdate) orig_PedKoWaterUpdate(self, dt, method);
 }
 static void Hook_SubmergeUpdate(void* self, float dt, void* method) {
@@ -820,6 +835,183 @@ static void Hook_PedGravityUpdate(void* self, float dt, void* method) {
     }
     if (IsGhostProtectedNow() || (!g_cfgState.bMasterDisable && g_cfgState.bFlyHack)) return;
     if (orig_PedGravityUpdate) orig_PedGravityUpdate(self, dt, method);
+}
+
+// ============================================================================
+// LADRRAZAsrc Exact AirWalk (CharacterActor Pre/PostSimulationUpdate + FallState)
+// + Anti-Taser & Anti-Faint (KnockoutState + Tizer/Knockout/LoseConsciousness)
+// ============================================================================
+static inline bool IsPedViewAspectLocal(const void* pedViewAspectPtr) {
+    if (!SafeMem::IsPlausiblePtr(pedViewAspectPtr)) return false;
+    int32_t localVid = g_localViewIdAtomic.load(std::memory_order_acquire);
+    if (localVid < 0) return false;
+    int64_t ent = 0;
+    if (!SafeMem::ReadVal(pedViewAspectPtr, ent) || ent == 0) return false;
+    return Morpeh::UnpackEntityId(ent) == localVid;
+}
+
+static inline void ApplyLadrrazaAirWalkGroundedFields(void* actor) {
+    if (!SafeMem::IsPlausiblePtr(actor)) return;
+    const auto& cfg = Offsets::g_cfg;
+    uint8_t* ab = reinterpret_cast<uint8_t*>(actor);
+    uint8_t one = 1, zeroB = 0;
+    int32_t zeroI = 0;
+    float zeroF = 0.0f, hundredF = 100.0f;
+    Vec3 upNormal{ 0.0f, 1.0f, 0.0f };
+
+    // Exact verified CharacterActor offsets from dump1.4.1.cpp & LADRRAZAsrc main.cpp L15270..15642
+    SafeMem::Write(ab + cfg.offCharActorAlwaysNotGnd,    &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorGrounded,        &one,   1);
+    SafeMem::Write(ab + cfg.offCharActorStable,          &one,   1);
+    SafeMem::Write(ab + cfg.offCharActorWasGrounded,     &one,   1);
+    SafeMem::Write(ab + cfg.offCharActorWasStable,       &one,   1);
+    SafeMem::Write(ab + cfg.offCharActorBecomeGrounded,  &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorBecomeStable,    &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorBecomeNotGnd,    &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorBecomeUnstable,  &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorForceNotGndFlag, &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorForceNotGndFrm,  &zeroI, sizeof(int32_t));
+    SafeMem::Write(ab + cfg.offCharActorContactNormal,   &upNormal, sizeof(Vec3));
+    SafeMem::Write(ab + cfg.offCharActorStableNormal,    &upNormal, sizeof(Vec3));
+    SafeMem::Write(ab + cfg.offCharActorSlopeAngle,      &zeroF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorIsOnEdge,        &zeroB, 1);
+    SafeMem::Write(ab + cfg.offCharActorGroundedTime,    &hundredF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorNotGroundedTime, &zeroF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorStableTime,      &hundredF, sizeof(float));
+    // Zero ONLY Y velocity components so horizontal walking/sprinting/combat stay 100% native
+    SafeMem::Write(ab + cfg.offCharActorInVel   + 4, &zeroF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorPreVel  + 4, &zeroF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorPostVel + 4, &zeroF, sizeof(float));
+    SafeMem::Write(ab + cfg.offCharActorExtVel  + 4, &zeroF, sizeof(float));
+}
+
+static inline void PurgeLocalTaserAndFaintNow() {
+    if (g_cfgState.bMasterDisable || (!g_cfgState.bAntiTaser && !g_cfgState.bAntiFaint)) return;
+    if (!Morpeh::g_stashes.worldReady) return;
+    int64_t ped = Morpeh::GetLocalPedEntity();
+    if (ped <= 0) return;
+    int64_t view = Morpeh::GetViewEntity(ped);
+
+    if (g_cfgState.bAntiTaser && Morpeh::g_stashes.weaponTizerTimerStash &&
+        Morpeh::Has(Morpeh::g_stashes.weaponTizerTimerStash, ped)) {
+        Morpeh::Remove(Morpeh::g_stashes.weaponTizerTimerStash, ped);
+    }
+    if (g_cfgState.bAntiFaint && Morpeh::g_stashes.loseConsciousnessStash &&
+        Morpeh::Has(Morpeh::g_stashes.loseConsciousnessStash, ped)) {
+        Morpeh::Remove(Morpeh::g_stashes.loseConsciousnessStash, ped);
+    }
+    if (Morpeh::g_stashes.pedBlockedInputStash && Morpeh::Has(Morpeh::g_stashes.pedBlockedInputStash, ped)) {
+        Morpeh::Remove(Morpeh::g_stashes.pedBlockedInputStash, ped);
+    }
+    if (Morpeh::g_stashes.elementFrozenStash && Morpeh::Has(Morpeh::g_stashes.elementFrozenStash, ped)) {
+        Morpeh::Remove(Morpeh::g_stashes.elementFrozenStash, ped);
+    }
+    if (view > 0) {
+        if (Morpeh::g_stashes.pedViewTaserPreKoStash && Morpeh::Has(Morpeh::g_stashes.pedViewTaserPreKoStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewTaserPreKoStash, view);
+        if (Morpeh::g_stashes.pedViewTaserKoStash && Morpeh::Has(Morpeh::g_stashes.pedViewTaserKoStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewTaserKoStash, view);
+        if (Morpeh::g_stashes.pedViewTaserKoVehStash && Morpeh::Has(Morpeh::g_stashes.pedViewTaserKoVehStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewTaserKoVehStash, view);
+        if (Morpeh::g_stashes.pedViewKoStash && Morpeh::Has(Morpeh::g_stashes.pedViewKoStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewKoStash, view);
+        if (Morpeh::g_stashes.pedViewKoTimerStash && Morpeh::Has(Morpeh::g_stashes.pedViewKoTimerStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewKoTimerStash, view);
+        if (Morpeh::g_stashes.pedViewMeleeKoStash && Morpeh::Has(Morpeh::g_stashes.pedViewMeleeKoStash, view))
+            Morpeh::Remove(Morpeh::g_stashes.pedViewMeleeKoStash, view);
+        if (Morpeh::g_stashes.pedViewIgnoreKoStash && !Morpeh::Has(Morpeh::g_stashes.pedViewIgnoreKoStash, view))
+            Morpeh::SetEmpty(Morpeh::g_stashes.pedViewIgnoreKoStash, view);
+    }
+}
+
+static void Hook_CharActor_PreSim(void* self, float dt, void* method) {
+    if (orig_CharActor_PreSim) orig_CharActor_PreSim(self, dt, method);
+    if (!g_cfgState.bMasterDisable && g_cfgState.bFlyHack && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive &&
+        !g_localInVehicle.load(std::memory_order_acquire) && self &&
+        self == g_localCharacterActor.load(std::memory_order_acquire)) {
+        ApplyLadrrazaAirWalkGroundedFields(self);
+    }
+}
+
+static void Hook_CharActor_PostSim(void* self, float dt, void* method) {
+    if (orig_CharActor_PostSim) orig_CharActor_PostSim(self, dt, method);
+    if (!g_cfgState.bMasterDisable && g_cfgState.bFlyHack && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive &&
+        !g_localInVehicle.load(std::memory_order_acquire) && self &&
+        self == g_localCharacterActor.load(std::memory_order_acquire)) {
+        ApplyLadrrazaAirWalkGroundedFields(self);
+
+        // Exact LADRRAZAsrc Camera-Guided AirWalk (main.cpp L15645-15666) on Unity's physics thread!
+        void* cam = Il2Cpp::SafeCameraGetMain();
+        void* camTr = cam ? Il2Cpp::SafeGetTransform(cam) : nullptr;
+        Vec3 camFwd{};
+        if (camTr && Il2Cpp::SafeGetTransformForward(camTr, camFwd) && std::fabs(camFwd.y) > 0.08f) {
+            void* actorTr = Il2Cpp::SafeGetTransform(self);
+            Vec3 pos{};
+            if (actorTr && Il2Cpp::SafeGetTransformPos(actorTr, pos) && IsFiniteVec3(pos)) {
+                float speed = std::clamp(g_cfgState.flySpeed, 2.0f, 35.0f);
+                float stepDt = (dt > 0.001f && dt < 0.1f) ? dt : 0.016f;
+                pos.y += camFwd.y * speed * stepDt;
+                if (Il2Cpp::g_unity.mPhysActor_SetPos) {
+                    Vec3 pArg = pos;
+                    void* a[1] = { &pArg };
+                    Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetPos, self, a);
+                } else {
+                    Il2Cpp::SafeSetTransformPos(actorTr, pos);
+                }
+                uint8_t* ab = reinterpret_cast<uint8_t*>(self);
+                SafeMem::Write(ab + Offsets::g_cfg.offPhysActorStartPos  + 4, &pos.y, sizeof(float));
+                SafeMem::Write(ab + Offsets::g_cfg.offPhysActorTargetPos + 4, &pos.y, sizeof(float));
+            }
+        }
+    }
+}
+
+template <int Idx>
+static bool Hook_FallStateCanEnter(void* self, const void* pedViewAspect, int32_t st, int32_t prev, void* method) {
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bFlyHack || IsGhostProtectedNow()) &&
+        !g_localInVehicle.load(std::memory_order_acquire) && IsPedViewAspectLocal(pedViewAspect)) {
+        return false;
+    }
+    return orig_FallState_CanEnter[Idx] ? orig_FallState_CanEnter[Idx](self, pedViewAspect, st, prev, method) : false;
+}
+
+template <int Idx>
+static bool Hook_KoStateCanEnter(void* self, const void* pedViewAspect, int32_t st, int32_t prev, void* method) {
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint || IsGhostProtectedNow()) &&
+        IsPedViewAspectLocal(pedViewAspect)) {
+        return false;
+    }
+    return orig_KoState_CanEnter[Idx] ? orig_KoState_CanEnter[Idx](self, pedViewAspect, st, prev, method) : false;
+}
+
+static void Hook_WeaponTizerSyncUpdate(void* self, float dt, void* method) {
+    if (orig_WeaponTizerSyncUpdate) orig_WeaponTizerSyncUpdate(self, dt, method);
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint)) {
+        PurgeLocalTaserAndFaintNow();
+    }
+}
+static void Hook_WeaponTizerTimerUpdate(void* self, float dt, void* method) {
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint)) {
+        PurgeLocalTaserAndFaintNow();
+    }
+    if (orig_WeaponTizerTimerUpdate) orig_WeaponTizerTimerUpdate(self, dt, method);
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint)) {
+        PurgeLocalTaserAndFaintNow();
+    }
+}
+static void Hook_PedViewKoSysUpdate(void* self, float dt, void* method) {
+    if (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint)) {
+        PurgeLocalTaserAndFaintNow();
+    }
+    if (orig_PedViewKoSysUpdate) orig_PedViewKoSysUpdate(self, dt, method);
+}
+static void Hook_LoseConscUpdate(void* self, float dt, void* method) {
+    if (!g_cfgState.bMasterDisable && g_cfgState.bAntiFaint) return;
+    if (orig_LoseConscUpdate) orig_LoseConscUpdate(self, dt, method);
+}
+static void Hook_SkipLoseConscUpdate(void* self, float dt, void* method) {
+    if (!g_cfgState.bMasterDisable && g_cfgState.bAntiFaint) return;
+    if (orig_SkipLoseConscUpdate) orig_SkipLoseConscUpdate(self, dt, method);
 }
 
 // KillAround Datagram hooks (managed interface / vtable fallbacks)
@@ -1042,12 +1234,60 @@ inline void EnsureFreeCamVoiceAndImmunityHooks() {
         Il2Cpp::SwapMethodPointer(m, (void*)Hook_WaterAreaTriggerStay, (void**)&orig_WaterAreaTriggerStay);
 }
 
+inline void EnsureAirWalkHooks() {
+    if (g_airWalkHooksInstalled || !Il2Cpp::Init()) return;
+    g_airWalkHooksInstalled = true;
+    const auto& c = Offsets::g_cfg;
+
+    // Virtual overrides on CharacterActor (Slot 21 & Slot 22 — verified dump1.4.1.cpp L1340632..1340636)
+    Il2Cpp::SwapVirtualMethod(c.nsCharacterController.c_str(), "CharacterActor", "PreSimulationUpdate", 1,
+                              (void*)Hook_CharActor_PreSim, (void**)&orig_CharActor_PreSim);
+    Il2Cpp::SwapVirtualMethod(c.nsCharacterController.c_str(), "CharacterActor", "PostSimulationUpdate", 1,
+                              (void*)Hook_CharActor_PostSim, (void**)&orig_CharActor_PostSim);
+
+    // Virtual CanEnterState (Slot 5) on all Fall states so AirWalk never enters Fall animation
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesFall.c_str(),     "FallState",                               "CanEnterState", 3, (void*)Hook_FallStateCanEnter<0>, (void**)&orig_FallState_CanEnter[0]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesFall.c_str(),     "FallForwardJumpState",                    "CanEnterState", 3, (void*)Hook_FallStateCanEnter<1>, (void**)&orig_FallState_CanEnter[1]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesWeapon.c_str(),   "WeaponRangeFallState",                    "CanEnterState", 3, (void*)Hook_FallStateCanEnter<2>, (void**)&orig_FallState_CanEnter[2]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesWeapon.c_str(),   "WeaponRangeFallForwardJumpState",         "CanEnterState", 3, (void*)Hook_FallStateCanEnter<3>, (void**)&orig_FallState_CanEnter[3]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesWeapon.c_str(),   "OneHandedMeleeWeaponFallState",           "CanEnterState", 3, (void*)Hook_FallStateCanEnter<4>, (void**)&orig_FallState_CanEnter[4]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesWeapon.c_str(),   "OneHandedMeleeWeaponFallForwardJumpState","CanEnterState", 3, (void*)Hook_FallStateCanEnter<5>, (void**)&orig_FallState_CanEnter[5]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesHandcuff.c_str(), "HandcuffFallState",                       "CanEnterState", 3, (void*)Hook_FallStateCanEnter<6>, (void**)&orig_FallState_CanEnter[6]);
+}
+
+inline void EnsureAntiTaserAndFaintHooks() {
+    if (g_antiTaserFaintHooksInstalled || !Il2Cpp::Init()) return;
+    g_antiTaserFaintHooksInstalled = true;
+    const auto& c = Offsets::g_cfg;
+
+    // Virtual CanEnterState (Slot 5) on all 5 Knockout states (verified dump1.4.1.cpp L369199..369483)
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesKnockout.c_str(), "KnockoutState",        "CanEnterState", 3, (void*)Hook_KoStateCanEnter<0>, (void**)&orig_KoState_CanEnter[0]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesKnockout.c_str(), "KnockoutAirState",     "CanEnterState", 3, (void*)Hook_KoStateCanEnter<1>, (void**)&orig_KoState_CanEnter[1]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesKnockout.c_str(), "KnockoutLandingState", "CanEnterState", 3, (void*)Hook_KoStateCanEnter<2>, (void**)&orig_KoState_CanEnter[2]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesKnockout.c_str(), "KnockoutRollState",    "CanEnterState", 3, (void*)Hook_KoStateCanEnter<3>, (void**)&orig_KoState_CanEnter[3]);
+    Il2Cpp::SwapVirtualMethod(c.nsPedStatesKnockout.c_str(), "KnockoutWaterState",   "CanEnterState", 3, (void*)Hook_KoStateCanEnter<4>, (void**)&orig_KoState_CanEnter[4]);
+
+    // Taser, Knockout & LoseConsciousness ECS Systems (verified dump1.4.1.cpp L100861..715505)
+    Il2Cpp::SwapVirtualMethod(c.nsWeaponSys.c_str(),    c.clsWeaponTizerSyncSys.c_str(),  "OnUpdate", 1, (void*)Hook_WeaponTizerSyncUpdate,  (void**)&orig_WeaponTizerSyncUpdate);
+    Il2Cpp::SwapVirtualMethod(c.nsWeaponSys.c_str(),    c.clsWeaponTizerTimerSys.c_str(), "OnUpdate", 1, (void*)Hook_WeaponTizerTimerUpdate, (void**)&orig_WeaponTizerTimerUpdate);
+    Il2Cpp::SwapVirtualMethod(c.nsPedViewSys.c_str(),   c.clsPedViewKnockoutSys.c_str(),  "OnUpdate", 1, (void*)Hook_PedViewKoSysUpdate,     (void**)&orig_PedViewKoSysUpdate);
+    Il2Cpp::SwapVirtualMethod(c.nsDeathProcSys.c_str(), c.clsLoseConsciousSys.c_str(),    "OnUpdate", 1, (void*)Hook_LoseConscUpdate,        (void**)&orig_LoseConscUpdate);
+    Il2Cpp::SwapVirtualMethod(c.nsDeathProcSys.c_str(), c.clsSkipLoseConscSys.c_str(),    "OnUpdate", 1, (void*)Hook_SkipLoseConscUpdate,    (void**)&orig_SkipLoseConscUpdate);
+}
+
 inline void InstallLazyFeatureHooks() {
     if (!g_hooksInstalled || !Il2Cpp::Init()) return;
     const auto& c = Offsets::g_cfg;
 
     if (g_cfgState.bFreeCam || g_cfgState.bSpectateActive || g_cfgState.bTalkFreeCam || g_cfgState.bFlyHack) {
         if (!g_freeCamPatchesInstalled && (g_cfgState.bFreeCam || g_cfgState.bSpectateActive || g_cfgState.bTalkFreeCam)) EnsureFreeCamSystemPatches();
+        if (!g_freeCamVoiceHooksInstalled) EnsureFreeCamVoiceAndImmunityHooks();
+    }
+    if (g_cfgState.bFlyHack && !g_airWalkHooksInstalled) {
+        EnsureAirWalkHooks();
+    }
+    if ((g_cfgState.bAntiTaser || g_cfgState.bAntiFaint) && !g_antiTaserFaintHooksInstalled) {
+        EnsureAntiTaserAndFaintHooks();
         if (!g_freeCamVoiceHooksInstalled) EnsureFreeCamVoiceAndImmunityHooks();
     }
 
@@ -1070,7 +1310,7 @@ inline void InstallLazyFeatureHooks() {
         if (void* m = Il2Cpp::ResolveMethod(c.nsMeleeConfirm.c_str(), c.clsMeleeConfirm.c_str(), "OnUpdate", 1))
             Il2Cpp::SwapMethodPointer(m, (void*)Hook_GZ_Melee, (void**)&orig_GZ_Melee);
     }
-    if (g_cfgState.bNoFall && !g_noFallHookInstalled) {
+    if ((g_cfgState.bNoFall || g_cfgState.bFlyHack) && !g_noFallHookInstalled) {
         g_noFallHookInstalled = true;
         if (void* m = Il2Cpp::ResolveMethod(c.nsFallDamageSys.c_str(), c.clsFallDamageSys.c_str(), "ApplyLocalFallDamage", 2))
             Il2Cpp::SwapMethodPointer(m, (void*)Hook_ApplyLocalFallDamage, (void**)&orig_ApplyLocalFallDamage);
@@ -1738,6 +1978,29 @@ inline void TickWeaponMods(int64_t localPed) {
     }
 }
 
+inline void TickAntiTaserAndFaint(int64_t localPed) {
+    static int64_t s_ownedIgnoreKoView = 0;
+    bool active = (!g_cfgState.bMasterDisable && (g_cfgState.bAntiTaser || g_cfgState.bAntiFaint));
+    if (!active) {
+        if (s_ownedIgnoreKoView > 0 && Morpeh::g_stashes.pedViewIgnoreKoStash &&
+            Morpeh::Has(Morpeh::g_stashes.pedViewIgnoreKoStash, s_ownedIgnoreKoView)) {
+            Morpeh::Remove(Morpeh::g_stashes.pedViewIgnoreKoStash, s_ownedIgnoreKoView);
+        }
+        s_ownedIgnoreKoView = 0;
+        return;
+    }
+    if (localPed <= 0) return;
+    int64_t view = Morpeh::GetViewEntity(localPed);
+    if (view > 0) {
+        Hooks::g_localViewIdAtomic.store(Morpeh::UnpackEntityId(view), std::memory_order_release);
+        if (Morpeh::g_stashes.pedViewIgnoreKoStash && !Morpeh::Has(Morpeh::g_stashes.pedViewIgnoreKoStash, view)) {
+            Morpeh::SetEmpty(Morpeh::g_stashes.pedViewIgnoreKoStash, view);
+            s_ownedIgnoreKoView = view;
+        }
+    }
+    Hooks::PurgeLocalTaserAndFaintNow();
+}
+
 inline void TickMovementMods(float dt) {
     int64_t ped = 0, view = 0;
     void* pv = nullptr;
@@ -1747,6 +2010,10 @@ inline void TickMovementMods(float dt) {
     void* rb = SafeMem::PtrAt(pv, Offsets::g_cfg.offPedViewRigidbody);
     void* tr = SafeMem::PtrAt(pv, Offsets::g_cfg.offPedViewRoot);
     void* actor = SafeMem::PtrAt(pv, Offsets::g_cfg.offPedViewActor);
+
+    // Publish live local actor & view ID for CharacterActor AirWalk & PedState hooks
+    Hooks::g_localCharacterActor.store(actor, std::memory_order_release);
+    Hooks::g_localViewIdAtomic.store(Morpeh::UnpackEntityId(view), std::memory_order_release);
 
     // Super Jump (PhysicsActor::VerticalVelocity primary + Rigidbody fallback)
     if (g_cfgState.bSuperJump) {
@@ -1799,12 +2066,10 @@ inline void TickMovementMods(float dt) {
     }
 
     // =========================================================================
-    // Crash-Free Grounded Y-Floor Skywalk (ZERO CreatePrimitive / ZERO ForceNotGrounded!
-    // Keeps CharacterActor grounded & active so walking, aiming & shooting work 100%
-    // normally while locking ONLY vertical Y altitude) + Game-Controlled Car Fly
+    // LADRRAZAsrc AirWalk (driven via CharacterActor Pre/PostSim + FallState hooks)
+    // + Game-Controlled Car Fly
     // =========================================================================
     static bool  s_skyFloorActive = false;
-    static float s_skyFloorY      = 0.0f;
     static void* s_skyFloorRb     = nullptr;
 
     static bool  s_carFlyActive = false;
@@ -1933,6 +2198,7 @@ inline void TickMovementMods(float dt) {
     bool pedFly = g_cfgState.bFlyHack && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive;
     bool carFly = g_cfgState.bCarFly && !g_cfgState.bFreeCam && !g_cfgState.bSpectateActive;
     int64_t veh = Morpeh::GetLocalVehicleLogicEntity(ped);
+    Hooks::g_localInVehicle.store(veh > 0, std::memory_order_release);
 
     if (!pedFly || veh > 0) disableSkyFloor();
     if (!carFly || veh <= 0) restoreCarFlyPhysics();
@@ -2008,82 +2274,26 @@ inline void TickMovementMods(float dt) {
                 }
             }
         }
-        // --- CRASH-FREE GROUNDED Y-FLOOR SKYWALK (Zero CreatePrimitive, normal walk/aim/shoot!) ---
+        // --- LADRRAZAsrc AIRWALK COMPANION (Unity physics handled natively in CharacterActor Pre/PostSim hooks!) ---
         else if (pedFly && tr && Il2Cpp::IsTransformAlive(tr)) {
-            Vec3 footPos{};
-            if (ReadTransformPosition(tr, footPos) && IsFiniteVec3(footPos)) {
-                if (!s_skyFloorActive) {
-                    s_skyFloorY = footPos.y;
-                    s_skyFloorRb = rb;
-                    s_skyFloorActive = true;
-                }
+            if (!s_skyFloorActive) {
                 s_skyFloorRb = rb;
+                s_skyFloorActive = true;
+            }
+            s_skyFloorRb = rb;
 
-                float climbRate = std::clamp(g_cfgState.flySpeed * 0.45f, 2.0f, 18.0f);
-                if (gi.jump) {
-                    s_skyFloorY += climbRate * dt;
-                } else if (gi.crouch) {
-                    s_skyFloorY -= climbRate * dt;
-                } else if (std::fabs(gi.pedV) > 0.15f && std::fabs(fwd.y) > 0.24f) {
-                    s_skyFloorY += fwd.y * gi.pedV * climbRate * 0.85f * dt;
+            // Keep Rigidbody gravity OFF while AirWalk hooks drive Grounded + Camera-Y walk on Unity physics thread
+            if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
+                Il2Cpp::SafeSetRbGravity(rb, false);
+                Il2Cpp::SafeSetRbKinematic(rb, false);
+                Vec3 curVel{};
+                if (Il2Cpp::SafeGetRbVelocity(rb, curVel) && std::fabs(curVel.y) > 0.001f) {
+                    Il2Cpp::SafeSetRbVelocity(rb, { curVel.x, 0.0f, curVel.z });
                 }
-
-                // Cancel ONLY vertical gravity/fall speed while preserving 100% of natural X/Z walking & combat!
-                if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
-                    Il2Cpp::SafeSetRbGravity(rb, false);
-                    Il2Cpp::SafeSetRbKinematic(rb, false);
-                    Vec3 curVel{};
-                    if (Il2Cpp::SafeGetRbVelocity(rb, curVel) && std::fabs(curVel.y) > 0.001f) {
-                        Il2Cpp::SafeSetRbVelocity(rb, { curVel.x, 0.0f, curVel.z });
-                    }
-                }
-
-                const auto& cfg = Offsets::g_cfg;
-                if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
-                    Il2Cpp::SafeSetBehaviourEnabled(actor, true);
-                    if (Il2Cpp::g_unity.mPhysActor_SetVertVel) {
-                        Vec3 zeroV{ 0.0f, 0.0f, 0.0f };
-                        void* va[1] = { &zeroV };
-                        Il2Cpp::SafeInvoke(Il2Cpp::g_unity.mPhysActor_SetVertVel, actor, va);
-                    }
-                    // Keep CharacterActor grounded & stable (dump1.4.1.cpp L1340160..L1340185) so PedStateMachine
-                    // stays in normal standing/walking state (weapons, aiming, shooting & reloading all work!)
-                    uint8_t* ab = reinterpret_cast<uint8_t*>(actor);
-                    uint8_t one = 1, zeroB = 0;
-                    float oneF = 1.0f, zeroF = 0.0f;
-                    SafeMem::Write(ab + cfg.offCharActorGrounded, &one, 1);     // 0x1A0 IsGrounded
-                    SafeMem::Write(ab + cfg.offCharActorStable,   &one, 1);     // 0x1A1 IsStable
-                    SafeMem::Write(ab + 0x1A2, &one, 1);                        // 0x1A2 WasGrounded
-                    SafeMem::Write(ab + 0x1A3, &one, 1);                        // 0x1A3 WasStable
-                    SafeMem::Write(ab + 0x1A6, &zeroB, 1);                      // 0x1A6 HasBecomeNotGrounded
-                    SafeMem::Write(ab + 0x1A7, &zeroB, 1);                      // 0x1A7 HasBecomeUnstable
-                    SafeMem::Write(ab + 0x208, &oneF, sizeof(float));           // 0x208 GroundedTime
-                    SafeMem::Write(ab + 0x20C, &zeroF, sizeof(float));          // 0x20C NotGroundedTime
-                    SafeMem::Write(ab + 0x210, &oneF, sizeof(float));           // 0x210 StableElapsedTime
-
-                    // Zero ONLY Y component of internal velocities & clamp Y of start/target interpolation positions
-                    SafeMem::Write(ab + cfg.offCharActorPreVel  + 4, &zeroF, sizeof(float));
-                    SafeMem::Write(ab + cfg.offCharActorPostVel + 4, &zeroF, sizeof(float));
-                    SafeMem::Write(ab + cfg.offCharActorExtVel  + 4, &zeroF, sizeof(float));
-                    SafeMem::Write(ab + cfg.offPhysActorStartPos  + 4, &s_skyFloorY, sizeof(float));
-                    SafeMem::Write(ab + cfg.offPhysActorTargetPos + 4, &s_skyFloorY, sizeof(float));
-                }
-
-                // Clamp ONLY Y altitude while preserving X/Z untouched from the game's own walking controller!
-                Vec3 clampedPos{ footPos.x, s_skyFloorY, footPos.z };
-                if (std::fabs(footPos.y - s_skyFloorY) > 0.005f) {
-                    Il2Cpp::SafeSetTransformPos(tr, clampedPos);
-                    if (rb && Il2Cpp::IsRigidbodyAlive(rb)) {
-                        Il2Cpp::SafeSetRbPosition(rb, clampedPos);
-                    }
-                    Il2Cpp::SafePhysicsSyncTransforms();
-                }
-                int32_t pedId = Morpeh::UnpackEntityId(ped);
-                if (pedId >= 0) {
-                    if (void* posPtr = Morpeh::Get(Morpeh::g_stashes.positionStash, pedId, sizeof(Vec3))) {
-                        SafeMem::Write(posPtr, &clampedPos, sizeof(Vec3));
-                    }
-                }
+            }
+            if (actor && Il2Cpp::IsUnityNativeAlive(actor)) {
+                Il2Cpp::SafeSetBehaviourEnabled(actor, true);
+                Hooks::ApplyLadrrazaAirWalkGroundedFields(actor);
             }
         }
     }
@@ -4675,6 +4885,7 @@ inline void TickRuntime() {
     }
     TickCameraFovAndAspect();
     TickRemoveGameCrosshair();
+    TickAntiTaserAndFaint(Morpeh::GetLocalPedEntity());
     TickMovementMods(dt);
     TickPlayerScale();
     TickAutomation(dt);

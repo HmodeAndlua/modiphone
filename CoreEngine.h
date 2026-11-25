@@ -372,6 +372,8 @@ struct RuntimeSettings {
     bool bAutoVest           = false;
     int  autoVestUnderPct    = 50;
     bool bNoFall             = false;
+    bool bAntiTaser          = false;
+    bool bAntiFaint          = false;
     bool bGreenZoneBypass    = false;
     bool bZoneGuard          = false;
     bool bSuperJump          = false;
@@ -794,6 +796,34 @@ inline bool SwapMethodPointer(void* methodInfo, void* replacement, void** outOri
     if (!SafeMem::IsPlausiblePtr(orig) || orig == replacement) return false;
     if (outOrig) *outOrig = orig;
     return SafeMem::Write(methodInfo, &replacement, sizeof(void*));
+}
+
+// Patches BOTH MethodInfo->methodPointer AND every matching VirtualInvokeData {orig, methodInfo} slot
+// inside Il2CppClass->vtable[] (writable heap memory — zero __TEXT patches, works on jailed & jailbroken iOS).
+inline bool SwapVirtualMethod(const char* nsName, const char* clsName, const char* methodName, int argc,
+                              void* replacement, void** outOrig) {
+    if (!clsName || !methodName || !replacement || !Init()) return false;
+    void* klass = FindClass(nsName, clsName);
+    if (!SafeMem::IsPlausiblePtr(klass) || !g_api.class_get_method_from_name) return false;
+    void* methodInfo = nullptr;
+    TCFlyGuard::TryRun([&]() {
+        methodInfo = g_api.class_get_method_from_name(klass, methodName, argc);
+    });
+    if (!SafeMem::IsPlausiblePtr(methodInfo)) return false;
+    void* orig = SafeMem::PtrAt(methodInfo, 0);
+    if (!SafeMem::IsPlausiblePtr(orig) || orig == replacement) return false;
+    if (outOrig) *outOrig = orig;
+
+    bool patchedMethod = SafeMem::Write(methodInfo, &replacement, sizeof(void*));
+    uint8_t* kBase = reinterpret_cast<uint8_t*>(klass);
+    for (size_t off = 0x100; off < 0x3800; off += sizeof(void*)) {
+        void* pair[2]{};
+        if (!SafeMem::Read(kBase + off, pair, sizeof(pair))) break;
+        if (pair[0] == orig && pair[1] == methodInfo) {
+            SafeMem::Write(kBase + off, &replacement, sizeof(void*));
+        }
+    }
+    return patchedMethod;
 }
 
 inline void* SafeInvoke(void* methodInfo, void* instance, void** params, void** outExc = nullptr) {
@@ -1729,6 +1759,15 @@ struct Stashes {
     void* hudMapCachedMarkerStash = nullptr; // HudMapCachedNavMarker
     void* hudMapCreateCpStash     = nullptr; // HudMapCreateCheckpoint
     void* hudMapCheckpointStash   = nullptr; // HudMapCheckpoint (persistent user-placed map pin entity)
+    // Anti-Taser & Anti-Faint (LoseConsciousness) Stashes (verified dump1.4.1.cpp)
+    void* weaponTizerTimerStash   = nullptr; // WeaponTizerTimer
+    void* pedViewTaserKoStash     = nullptr; // PedViewTaserKnockout
+    void* pedViewTaserKoVehStash  = nullptr; // PedViewTaserKnockoutInVehicle
+    void* pedViewTaserPreKoStash  = nullptr; // PedViewTaserPreKnockout
+    void* pedViewKoTimerStash     = nullptr; // PedViewKnockoutTimer
+    void* pedViewIgnoreKoStash    = nullptr; // PedViewIgnoreKnockout
+    void* pedViewMeleeKoStash     = nullptr; // PedViewMeleeKnockout
+    void* loseConsciousnessStash  = nullptr; // LoseConsciousness (TagStash)
 } g_stashes;
 
 inline bool IsWorldAlive(void* world) {
@@ -2048,6 +2087,14 @@ inline void RefreshStoragesIfNeeded() {
         g_stashes.realHudMapNavService = nullptr;
         g_stashes.realHudMapNavSystem = nullptr;
         g_stashes.hudMapCheckpointStash = nullptr;
+        g_stashes.weaponTizerTimerStash = nullptr;
+        g_stashes.pedViewTaserKoStash = nullptr;
+        g_stashes.pedViewTaserKoVehStash = nullptr;
+        g_stashes.pedViewTaserPreKoStash = nullptr;
+        g_stashes.pedViewKoTimerStash = nullptr;
+        g_stashes.pedViewIgnoreKoStash = nullptr;
+        g_stashes.pedViewMeleeKoStash = nullptr;
+        g_stashes.loseConsciousnessStash = nullptr;
         g_stashes.pedViewStash = nullptr;
         g_stashes.pedToLogicLinkStash = nullptr;
         g_stashes.controlsEntityStash = nullptr;
@@ -2171,6 +2218,14 @@ inline void RefreshStoragesIfNeeded() {
     bindStash(g_stashes.hudMapCachedMarkerStash,c.nsHudMapComponents,     c.compHudMapCachedMarker);
     bindStash(g_stashes.hudMapCreateCpStash,    c.nsHudMapComponents,     c.compHudMapCreateCp);
     bindStash(g_stashes.hudMapCheckpointStash,  c.nsHudMapComponents,     c.compHudMapCheckpoint);
+    bindStash(g_stashes.weaponTizerTimerStash,  c.nsWeaponComponents,     c.compWeaponTizerTimer);
+    bindStash(g_stashes.pedViewTaserKoStash,    c.nsPedViewComponents,    c.compPedViewTaserKo);
+    bindStash(g_stashes.pedViewTaserKoVehStash, c.nsPedViewComponents,    c.compPedViewTaserKoVeh);
+    bindStash(g_stashes.pedViewTaserPreKoStash, c.nsPedViewComponents,    c.compPedViewTaserPreKo);
+    bindStash(g_stashes.pedViewKoTimerStash,    c.nsPedViewComponents,    c.compPedViewKoTimer);
+    bindStash(g_stashes.pedViewIgnoreKoStash,   c.nsPedViewComponents,    c.compPedViewIgnoreKo);
+    bindStash(g_stashes.pedViewMeleeKoStash,    c.nsMeleeCombatComps,     c.compPedViewMeleeKo);
+    bindStash(g_stashes.loseConsciousnessStash, c.nsDeathProcComps,       c.compLoseConsciousness);
 
     BindStorageDirectStashes();
     g_stashes.worldReady = (g_stashes.pedViewStash != nullptr);
@@ -2441,6 +2496,7 @@ inline bool SetEmpty(void* stash, int64_t packedEntity) {
     if (!SafeMem::IsPlausiblePtr(stash) || packedEntity == 0) return false;
     void* klass = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(stash) : nullptr;
     void* m = klass ? Il2Cpp::g_api.class_get_method_from_name(klass, "Set", 1) : nullptr;
+    if (!m && klass) m = Il2Cpp::g_api.class_get_method_from_name(klass, "Add", 1);
     if (!m) return false;
     void* args[1] = { &packedEntity };
     Il2Cpp::SafeInvoke(m, stash, args);
@@ -2787,6 +2843,8 @@ inline void SaveProfile(const char* name) {
         @"aimFov": @(g_cfgState.aimFov),
         @"aimSmoothing": @(g_cfgState.aimSmoothing),
         @"bNoFall": @(g_cfgState.bNoFall),
+        @"bAntiTaser": @(g_cfgState.bAntiTaser),
+        @"bAntiFaint": @(g_cfgState.bAntiFaint),
         @"bInfStamina": @(g_cfgState.bInfStamina),
         @"bAutoHeal": @(g_cfgState.bAutoHeal),
         @"bAutoVest": @(g_cfgState.bAutoVest),
@@ -2859,6 +2917,8 @@ inline void LoadProfile(const char* name) {
     fVal(@"aimFov", g_cfgState.aimFov);
     fVal(@"aimSmoothing", g_cfgState.aimSmoothing);
     bVal(@"bNoFall", g_cfgState.bNoFall);
+    bVal(@"bAntiTaser", g_cfgState.bAntiTaser);
+    bVal(@"bAntiFaint", g_cfgState.bAntiFaint);
     bVal(@"bInfStamina", g_cfgState.bInfStamina);
     bVal(@"bAutoHeal", g_cfgState.bAutoHeal);
     bVal(@"bAutoVest", g_cfgState.bAutoVest);

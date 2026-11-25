@@ -333,6 +333,28 @@ struct TargetConfig {
     std::string nsMeleeDatagrams       = "dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Datagrams";
     std::string nsWeaponDatagrams      = "dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Datagrams";
 
+    // Anti-Taser, Anti-Faint (LoseConsciousness) & PedView StateMachine (verified dump1.4.1.cpp)
+    std::string nsMeleeCombatComps     = "dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Components";
+    std::string nsDeathProcComps       = "dev.Scripts.ECS.Morpeh.Features.DeathProcessorFeature.Components";
+    std::string nsDeathProcSys         = "dev.Scripts.ECS.Morpeh.Features.DeathProcessorFeature.Systems";
+    std::string nsPedStatesFall        = "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Fall";
+    std::string nsPedStatesWeapon      = "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Weapon";
+    std::string nsPedStatesHandcuff    = "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Handcuff";
+    std::string nsPedStatesKnockout    = "dev.Scripts.ECS.Morpeh.Features.PedViewFeature.StateMachine.States.Knockout";
+    std::string clsWeaponTizerSyncSys  = "WeaponTizerEffectSyncSystem";
+    std::string clsWeaponTizerTimerSys = "WeaponTizerSetEffectAfterTimerSystem";
+    std::string clsPedViewKnockoutSys  = "PedViewKnockoutSystem";
+    std::string clsLoseConsciousSys    = "LoseConsciousnessSystem";
+    std::string clsSkipLoseConscSys    = "SkipLoseConsciousnessTimerSystem";
+    std::string compWeaponTizerTimer   = "WeaponTizerTimer";
+    std::string compPedViewTaserKo     = "PedViewTaserKnockout";
+    std::string compPedViewTaserKoVeh  = "PedViewTaserKnockoutInVehicle";
+    std::string compPedViewTaserPreKo  = "PedViewTaserPreKnockout";
+    std::string compPedViewKoTimer     = "PedViewKnockoutTimer";
+    std::string compPedViewIgnoreKo    = "PedViewIgnoreKnockout";
+    std::string compPedViewMeleeKo     = "PedViewMeleeKnockout";
+    std::string compLoseConsciousness  = "LoseConsciousness";
+
     size_t offStudioListenerAttenObj   = 0x28;  // StudioListener.attenuationObject
     size_t offStudioListenerRb         = 0x40;  // StudioListener.rigidBody
     size_t offSpatialMode              = 0x10;  // SpatialParameters.Mode (FmodMode)
@@ -342,9 +364,25 @@ struct TargetConfig {
     uint32_t kFmodMode2D               = 281022472U; // FmodMode::Mode2D (0x10C00008, dump L1444969)
     size_t offPhysActorStartPos        = 0x40;  // PhysicsActor.startingPosition (dump1.4.1.cpp L1341694)
     size_t offPhysActorTargetPos       = 0x4C;  // PhysicsActor.targetPosition (dump1.4.1.cpp L1341695)
+    size_t offCharActorAlwaysNotGnd    = 0xEC;  // CharacterActor.alwaysNotGrounded (dump1.4.1.cpp L1340105)
+    size_t offCharActorForceNotGndFlag = 0x158; // CharacterActor.forceNotGroundedFlag (L1340149)
+    size_t offCharActorForceNotGndFrm  = 0x15C; // CharacterActor.forceNotGroundedFrames (L1340150)
     size_t offCharActorRemovePen       = 0x190; // CharacterActor._removePenetrationAction
     size_t offCharActorGrounded        = 0x1A0; // CharacterActor.<IsGrounded>k__BackingField
     size_t offCharActorStable          = 0x1A1; // CharacterActor.<IsStable>k__BackingField
+    size_t offCharActorWasGrounded     = 0x1A2; // CharacterActor.<WasGrounded>k__BackingField
+    size_t offCharActorWasStable       = 0x1A3; // CharacterActor.<WasStable>k__BackingField
+    size_t offCharActorBecomeGrounded  = 0x1A4; // CharacterActor.<HasBecomeGrounded>k__BackingField
+    size_t offCharActorBecomeStable    = 0x1A5; // CharacterActor.<HasBecomeStable>k__BackingField
+    size_t offCharActorBecomeNotGnd    = 0x1A6; // CharacterActor.<HasBecomeNotGrounded>k__BackingField
+    size_t offCharActorBecomeUnstable  = 0x1A7; // CharacterActor.<HasBecomeUnstable>k__BackingField
+    size_t offCharActorContactNormal   = 0x1B4; // characterCollisionInfo (0x1A8) + groundContactNormal (0x0C)
+    size_t offCharActorStableNormal    = 0x1C0; // characterCollisionInfo (0x1A8) + groundStableNormal (0x18)
+    size_t offCharActorSlopeAngle      = 0x1CC; // characterCollisionInfo (0x1A8) + groundSlopeAngle (0x24)
+    size_t offCharActorIsOnEdge        = 0x1D0; // characterCollisionInfo (0x1A8) + isOnEdge (0x28)
+    size_t offCharActorGroundedTime    = 0x208; // CharacterActor.<GroundedTime>k__BackingField
+    size_t offCharActorNotGroundedTime = 0x20C; // CharacterActor.<NotGroundedTime>k__BackingField
+    size_t offCharActorStableTime      = 0x210; // CharacterActor.<StableElapsedTime>k__BackingField
     size_t offCharActorInVel           = 0x240; // CharacterActor.<InputVelocity>k__BackingField
     size_t offCharActorPreVel          = 0x24C; // CharacterActor.<PreSimulationVelocity>k__BackingField
     size_t offCharActorPostVel         = 0x258; // CharacterActor.<PostSimulationVelocity>k__BackingField

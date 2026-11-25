@@ -719,17 +719,6 @@ static OneStateGlassOverlay* g_overlay = nil;
             ThemeEngine::ProToggle(T("Enable Aimbot", "تفعيل الأيم بوت"), &g_cfgState.bEnableAimbot);
             ThemeEngine::ProToggle(T("Silent Aim (HWBP)", "سايلنت إيم (HWBP)"), &g_cfgState.bSilentAim);
             ThemeEngine::ProToggle(T("Bullet Wallbang", "اختراق الجدران للرصاص"), &g_cfgState.bSilentWallbang);
-            if (g_cfgState.bSilentAim || g_cfgState.bSilentWallbang) {
-                bool armed = Hooks::SilentAimHWBP::g_armed.load();
-                bool portOk = Hooks::SilentAimHWBP::g_portReady.load();
-                bool hasMask = (Hooks::SilentAimHWBP::ComputeWallbangLayerMask() != 0);
-                uint32_t hits = Hooks::g_hwBpHitCount.load();
-                ImGui::TextColored((armed || !portOk) ? ImVec4(0.25f, 1.0f, 0.70f, 1.0f) : ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
-                                   "%s: %s | Hits: %u | Wall: %s",
-                                   portOk ? "HWBP" : "Hook",
-                                   armed ? "ARMED" : (portOk ? "WAIT" : "FALLBACK"),
-                                   hits, hasMask ? "OK" : "-");
-            }
             ThemeEngine::ProToggle(T("Aim Lock Indicator", "مؤشر القفل على الهدف"), &g_cfgState.bAimIndicator);
             ThemeEngine::ProToggle(T("Smooth Camera Track", "تتبع كاميرا ناعم"), &g_cfgState.bSmoothCamAim);
             ThemeEngine::ProToggle(T("Draw FOV Ring", "إظهار دائرة المجال"), &g_cfgState.bDrawFov);
@@ -985,12 +974,12 @@ static OneStateGlassOverlay* g_overlay = nil;
     // ========================================================================
     else if (self.activeTab == 2) {
         if (curSub == 0) {
-            ThemeEngine::ProToggle(T("Player Skywalk (Grounded Y-Lock)", "مشي اللاعب بالسماء (بدون كراش)"), &g_cfgState.bFlyHack);
+            ThemeEngine::ProToggle(T("AirWalk (Walk In Sky)", "مشي بالسماء باتجاه الكاميرا"), &g_cfgState.bFlyHack);
             if (g_cfgState.bFlyHack) {
-                ImGui::TextDisabled("%s", T("Walk, aim & shoot normally! Jump=Rise • Crouch=Descend • Look up/down=Slope",
-                                            "امشِ وصوّب وأطلق النار طبيعياً! قفز=صعود • انحناء=نزول • النظر أعلى/أسفل=ميلان"));
+                ImGui::TextDisabled("%s", T("Look UP to rise, DOWN to descend — walk, aim & shoot normally",
+                                            "ارفع الكاميرا للصعود وأنزلها للنزول — امشِ وصوّب وأطلق طبيعياً"));
             }
-            ThemeEngine::ProSlider(T("Skywalk Climb Speed", "سرعة الصعود والنزول"), &g_cfgState.flySpeed, 2.0f, 40.0f, "%.1f m/s");
+            ThemeEngine::ProSlider(T("AirWalk Speed", "سرعة المشي بالسماء"), &g_cfgState.flySpeed, 2.0f, 35.0f, "%.1f m/s");
             ImGui::Spacing();
             ThemeEngine::ProToggle(T("Super Jump", "القفز الخارق"), &g_cfgState.bSuperJump);
             ThemeEngine::ProSlider(T("Jump Force", "قوة القفز"), &g_cfgState.superJumpForce, 5.0f, 50.0f, "%.1f");
@@ -1010,59 +999,10 @@ static OneStateGlassOverlay* g_overlay = nil;
             }
             ImGui::Spacing();
             ThemeEngine::ProToggle(T("Auto-TP When Placing Map Pin", "انتقال تلقائي عند وضع علامة بالخريطة"), &g_cfgState.bAutoMapMarkerTp);
-            std::vector<MapMarkerEntry> markers;
-            {
-                std::lock_guard<std::mutex> lk(g_espMutex);
-                markers = g_mapMarkers;
-            }
-            bool hasExactPin = false;
-            Vec3 pinCoords{};
-            for (const auto& m : markers) {
-                if (m.isExactMapPin || (m.isUserPin && m.priority >= 80)) {
-                    hasExactPin = true;
-                    pinCoords = m.worldPos;
-                    break;
-                }
-            }
-            if (hasExactPin) {
-                ImGui::TextColored(ImVec4(0.28f, 0.98f, 0.65f, 1.0f),
-                                   "%s: (%.0f, %.0f) | %s",
-                                   T("User Map Pin", "علامة الخريطة"),
-                                   pinCoords.x, pinCoords.z,
-                                   T("READY", "جاهزة"));
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.28f, 1.0f),
-                                   "%s: %s",
-                                   T("User Map Pin", "علامة الخريطة"),
-                                   T("NONE — Drop a pin on the map", "لا توجد — ضع علامة على الخريطة"));
-            }
-            ImGui::Spacing();
-            ThemeEngine::SectionSpacer(T("Detected Map Pins & Waypoints", "علامات الخريطة ونقاط الطريق"));
-
-            if (markers.empty()) {
-                ImGui::TextDisabled("%s", T("Open the map and place a marker pin — then tap Teleport or Refresh.",
-                                            "افتح الخريطة وضع علامة — ثم اضغط الانتقال أو تحديث."));
-            } else {
-                ImGui::BeginChild("##map_pins", ImVec2(0, 0), true);
-                for (size_t i = 0; i < markers.size(); ++i) {
-                    const auto& mk = markers[i];
-                    ImGui::PushID(static_cast<int>(i));
-                    const char* tag = mk.isExactMapPin ? "[PIN]" : (mk.isUserPin ? "[GPS]" : "[WP]");
-                    ImVec4 col = mk.isExactMapPin ? ImVec4(0.25f, 1.0f, 0.72f, 1.0f)
-                                                  : (mk.isUserPin ? ImVec4(0.30f, 0.92f, 1.0f, 1.0f)
-                                                                  : ImVec4(0.75f, 0.78f, 0.88f, 1.0f));
-                    ImGui::TextColored(col, "%s %s (%.0f, %.0f) - %.0fm",
-                                       tag, mk.label.c_str(), mk.worldPos.x, mk.worldPos.z, mk.distance);
-                    ImGui::SameLine(std::max(220.0f, contentW - 96.0f));
-                    if (ImGui::Button(T("TP##mktp", "انتقال##mktp"), ImVec2(76.0f, 26.0f))) {
-                        Features::TeleportToMapMarker(mk.worldPos, mk.label);
-                    }
-                    ImGui::PopID();
-                }
-                ImGui::EndChild();
-            }
         } else if (curSub == 2) {
             ThemeEngine::ProToggle(T("NoFall Damage", "منع ضرر السقوط"), &g_cfgState.bNoFall);
+            ThemeEngine::ProToggle(T("Anti-Taser (No Stun)", "منع التيزر والصعق"), &g_cfgState.bAntiTaser);
+            ThemeEngine::ProToggle(T("Anti-Faint (No Knockout)", "منع الإغماء وفقدان الوعي"), &g_cfgState.bAntiFaint);
             ThemeEngine::ProToggle(T("Infinite Stamina", "طاقة جري لا نهائية"), &g_cfgState.bInfStamina);
             ThemeEngine::ProToggle(T("Auto Heal (Inventory)", "علاج تلقائي"), &g_cfgState.bAutoHeal);
             ThemeEngine::ProSliderInt(T("Heal Under HP", "علاج تحت صحة"), &g_cfgState.autoHealUnderHp, 5, 95);
