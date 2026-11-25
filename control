@@ -1,0 +1,9 @@
+Package: com.ladrraza.onestatefull
+Name: OneState Full Obsidian
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Standalone Metal/ImGui runtime toolkit for One State RP reconstructed cleanly without remote AuthV4/anti-tamper locks.
+Maintainer: ladrraza@saw
+Author: ladrraza@saw
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
