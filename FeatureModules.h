@@ -74,6 +74,7 @@ inline SystemUpdateFn      orig_UnderwaterReactUpdate = nullptr;
 inline WaterTriggerFn      orig_WaterAreaTriggerStay = nullptr;
 inline WriteDatagramFn     orig_PedDispRead = nullptr, orig_PedDispWrite = nullptr;
 inline WriteDatagramFn     orig_PedDeadRead = nullptr, orig_MeleeAtkRead = nullptr, orig_MeleeReqWrite = nullptr;
+inline SystemUpdateFn      orig_WeaponProduceMeleeUpdate = nullptr, orig_ElemSendDispUpdate = nullptr;
 // LADRRAZAsrc AirWalk (CharacterActor) + Anti-Taser & Anti-Faint (Knockout / LoseConsciousness)
 inline CharActorSimFn      orig_CharActor_PreSim = nullptr, orig_CharActor_PostSim = nullptr;
 inline PedStateCanEnterFn  orig_FallState_CanEnter[7]{};
@@ -94,6 +95,7 @@ inline bool   g_deviceIdHookInstalled = false;
 inline bool   g_freeCamPatchesInstalled = false;
 inline bool   g_freeCamVoiceHooksInstalled = false;
 inline bool   g_killAroundHooksInstalled = false;
+inline bool   g_kaCaptureHooksInstalled = false;
 inline bool   g_mapHooksInstalled = false;
 inline bool   g_airWalkHooksInstalled = false;
 inline bool   g_antiTaserFaintHooksInstalled = false;
@@ -1035,6 +1037,16 @@ static void Hook_MeleeReqWrite(void* self, void* writer, void* method) {
     KillAround::OnMeleeRequestWrite(self);
     if (orig_MeleeReqWrite) orig_MeleeReqWrite(self, writer, method);
 }
+static void Hook_WeaponProduceMeleeUpdate(void* self, float dt, void* method) {
+    if (SafeMem::IsPlausiblePtr(self))
+        KillAround::g_kaWeaponProduceMeleeSys.store(self, std::memory_order_release);
+    if (orig_WeaponProduceMeleeUpdate) orig_WeaponProduceMeleeUpdate(self, dt, method);
+}
+static void Hook_ElemSendDispUpdate(void* self, float dt, void* method) {
+    if (SafeMem::IsPlausiblePtr(self))
+        KillAround::g_kaElemSendDispSys.store(self, std::memory_order_release);
+    if (orig_ElemSendDispUpdate) orig_ElemSendDispUpdate(self, dt, method);
+}
 
 static void Hook_TempWeaponSetLocal(void* self, int32_t weaponType, int32_t startAmmo, bool isInf, void* method) {
     if (SafeMem::IsPlausiblePtr(self)) Morpeh::g_stashes.realTempWeaponSvc = self;
@@ -1330,23 +1342,32 @@ inline void InstallLazyFeatureHooks() {
                 Il2Cpp::SwapMethodPointer(m, (void*)Hook_RayCastRanged8, (void**)&orig_RayCastRanged8);
         }
     }
+    if (Morpeh::g_stashes.worldReady && !g_kaCaptureHooksInstalled) {
+        g_kaCaptureHooksInstalled = true;
+        if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "OnUpdate", 1))
+            Il2Cpp::SwapMethodPointer(m, (void*)Hook_WeaponProduceMeleeUpdate, (void**)&orig_WeaponProduceMeleeUpdate);
+        if (void* m = Il2Cpp::ResolveMethod(c.nsElementsSys.c_str(), "ElementSendDisplacementSystem", "OnUpdate", 1))
+            Il2Cpp::SwapMethodPointer(m, (void*)Hook_ElemSendDispUpdate, (void**)&orig_ElemSendDispUpdate);
+    }
     bool wantKillAround = g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
+                          KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
+                          KillAround::g_kaPendingKillElemId.load(std::memory_order_relaxed) > 0 ||
                           KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 ||
                           (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
                            g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
                            g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3);
     if (wantKillAround && !g_killAroundHooksInstalled && Morpeh::g_stashes.worldReady) {
         g_killAroundHooksInstalled = true;
-        if (void* m = Il2Cpp::ResolveMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Read", 1))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_PedDispRead, (void**)&orig_PedDispRead);
-        if (void* m = Il2Cpp::ResolveMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Write", 1))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_PedDispWrite, (void**)&orig_PedDispWrite);
-        if (void* m = Il2Cpp::ResolveMethod(c.nsIBNetPedSync.c_str(), "PedDeadDatagram", "Read", 1))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_PedDeadRead, (void**)&orig_PedDeadRead);
-        if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", "Read", 1))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_MeleeAtkRead, (void**)&orig_MeleeAtkRead);
-        if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram", "Write", 1))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_MeleeReqWrite, (void**)&orig_MeleeReqWrite);
+        Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Read", 1,
+                                  (void*)Hook_PedDispRead, (void**)&orig_PedDispRead);
+        Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Write", 1,
+                                  (void*)Hook_PedDispWrite, (void**)&orig_PedDispWrite);
+        Il2Cpp::SwapVirtualMethod(c.nsIBNetPedSync.c_str(), "PedDeadDatagram", "Read", 1,
+                                  (void*)Hook_PedDeadRead, (void**)&orig_PedDeadRead);
+        Il2Cpp::SwapVirtualMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", "Read", 1,
+                                  (void*)Hook_MeleeAtkRead, (void**)&orig_MeleeAtkRead);
+        Il2Cpp::SwapVirtualMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram", "Write", 1,
+                                  (void*)Hook_MeleeReqWrite, (void**)&orig_MeleeReqWrite);
     }
     if (g_cfgState.bVehSpawnCapture && !g_vehSpawnHooksInstalled) {
         g_vehSpawnHooksInstalled = true;
@@ -4874,6 +4895,8 @@ inline void TickRuntime() {
     Hooks::SilentAimHWBP::Tick();
     if (!Morpeh::g_stashes.worldReady) return;
     if (g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
+        KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
+        KillAround::g_kaPendingStopAll.load(std::memory_order_relaxed) ||
         KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 ||
         KillAround::g_kaPendingKillElemId.load(std::memory_order_relaxed) > 0 ||
         KillAround::g_kaPendingRestoreGhost.load(std::memory_order_relaxed) ||
