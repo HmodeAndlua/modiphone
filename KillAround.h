@@ -800,6 +800,9 @@ inline int KillSingleTargetBurst(int32_t targetElemId, int32_t targetGen, int32_
     int64_t targetPed = Morpeh::GetEntityById(targetElemId);
     if (localPed <= 0 || targetPed <= 0) return 0;
 
+    // Check if target is valid (not dead, not null)
+    if (targetPed <= 0) return 0;
+
     Vec3 hitPosUnity = { hitPos.x, hitPos.y + 0.9f, hitPos.z };
     Vec3 dirUnity    = { dir.x, dir.y, dir.z };
     bool isKnockout  = true;
@@ -809,19 +812,14 @@ inline int KillSingleTargetBurst(int32_t targetElemId, int32_t targetGen, int32_
 
     void* params[8] = {
         &localPed, &targetPed, &hitPosUnity, &dirUnity,
-        &meleeDir, &heightTy, &attackTy, &isKnockout
+        &MeleeEnum::kDirFront, &MeleeEnum::kHeightMiddle, &MeleeEnum::kAtkFinisher, &isKnockout
     };
-
-    void* klass = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Systems",
-                                    "WeaponProduceAttackMeleeSystem");
-    if (!klass) { g_kaLastSendError.store(2, std::memory_order_relaxed); return 0; }
-    void* mi = Il2Cpp::g_api.class_get_method_from_name(klass, "SendAttackRequest", 8);
-    if (!mi) { g_kaLastSendError.store(3, std::memory_order_relaxed); return 0; }
-
     void* exc = nullptr;
-    Il2Cpp::SafeInvoke(mi, nullptr, params, &exc);
+    Il2Cpp::g_api.runtime_invoke(Il2Cpp::g_api.class_get_method_from_name(
+        Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Systems",
+                         "WeaponProduceAttackMeleeSystem"),
+        "SendAttackRequest", 8), nullptr, params, &exc);
     if (exc != nullptr) { g_kaLastSendError.store(1, std::memory_order_relaxed); return 0; }
-
     g_kaLastSendError.store(0, std::memory_order_relaxed);
     g_kaCombatFinishAtMs = nowMs + 450;
     g_kaTargetSentHits += 1;
