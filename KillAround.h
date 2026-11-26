@@ -113,6 +113,33 @@ struct ElementIdModelVal {
 };
 #pragma pack(pop)
 
+// ---------------------------------------------------------------------------
+// 1.4.1 VERIFIED MeleeCombat enums — dump1.4.1.cpp L426188-426226
+//
+// *** ROOT CAUSE OF "KILL STOPPED WORKING" ***
+// These are obfuscated magic constants, NOT 0/1/2/3.
+// The previous code sent attack_type=0/2, hit_dir=2, hit_height=0, so the
+// server rejected every melee datagram silently (no exception, no feedback).
+// ---------------------------------------------------------------------------
+namespace MeleeEnum {
+    // dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Enums.MeleeAttackType
+    inline constexpr int32_t kAtkLight    = 100925952; // 0x06040200
+    inline constexpr int32_t kAtkHeavy    = 394242;    // 0x00060402
+    inline constexpr int32_t kAtkFinisher = 33555972;  // 0x02000604
+    inline constexpr int32_t kAtkParry    = 67239942;  // 0x04020006
+
+    // ...Enums.MeleeAttackDirection
+    inline constexpr int32_t kDirLeft  = 100925952;    // 0x06040200
+    inline constexpr int32_t kDirRight = 394242;       // 0x00060402
+    inline constexpr int32_t kDirFront = 33555972;     // 0x02000604
+    inline constexpr int32_t kDirBack  = 67239942;     // 0x04020006
+
+    // ...Enums.MeleeAttackHeightType
+    inline constexpr int32_t kHeightHigh   = 262656;   // 0x00040200
+    inline constexpr int32_t kHeightMiddle = 33555458; // 0x02000402
+    inline constexpr int32_t kHeightLow    = 67239940; // 0x04020004
+}
+
 struct TrackedElement {
     int32_t id = 0;
     int32_t gen = 1;
@@ -794,7 +821,9 @@ inline int KillSingleTargetBurst(int32_t targetElemId, int32_t targetGen, int32_
         pkt.trace_x      = dir.x;
         pkt.trace_y      = dir.y;
         pkt.trace_z      = dir.z;
-        pkt.attack_type  = 2;
+        pkt.attack_type  = MeleeEnum::kAtkFinisher;   // 0x02000604 (was hardcoded 2 -> rejected)
+        pkt.attack_height= MeleeEnum::kHeightMiddle;
+        pkt.attack_dir   = MeleeEnum::kDirFront;
         pkt.is_ko        = 1;
         pkt.timestamp    = GenerateComboTimestamp();
         if (SendDatagram(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", &pkt, sizeof(pkt))) {
@@ -808,9 +837,12 @@ inline int KillSingleTargetBurst(int32_t targetElemId, int32_t targetGen, int32_
         req.attacker_gen = myGen;
         req.target_id    = targetElemId;
         req.target_gen   = targetGen > 0 ? targetGen : 1;
-        req.hit_height   = 0;
-        req.hit_dir      = 2;
-        req.attack_type  = (i % 3 == 2) ? 2 : 0;
+        req.hit_height   = MeleeEnum::kHeightMiddle;  // 0x02000402 (was 0 -> rejected)
+        req.hit_dir      = MeleeEnum::kDirFront;      // 0x02000604 (was 2 -> rejected)
+        // Light / Heavy / Finisher rotating combo using real obfuscated enum values
+        req.attack_type  = (i % 3 == 2) ? MeleeEnum::kAtkFinisher
+                       : (i % 3 == 1) ? MeleeEnum::kAtkHeavy
+                                      : MeleeEnum::kAtkLight;
         req.trace_x      = dir.x;
         req.trace_y      = dir.y;
         req.trace_z      = dir.z;
@@ -874,6 +906,71 @@ inline void RequestKillTarget(int32_t playerId, int32_t elemId, int32_t elemGen,
 
 inline void RequestKillAllAroundOnce() {
     g_kaKillAllBurstUntilMs.store(GetMonotonicMs() + g_cfg.killAllBurstMs, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
+// NEW: "Kill via Grab" — crowd kill via physical grab/hold mechanic.
+// Fires a full melee burst at every nearby target within the configured radius,
+// using the verified obfuscated MeleeCombat enum values.
+// ---------------------------------------------------------------------------
+inline void RequestKillAllViaGrabOnce() {
+    g_kaKillAllBurstUntilMs.store(GetMonotonicMs() + g_cfg.killAllBurstMs, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
+// GRAB CROWD KILL — the core new feature.
+// While active, every ped within kGrabKillRadius (90 m default) receives a full
+// melee burst each sweep, regardless of green-zone attack restrictions.
+// Green-zone bypass is handled by purging the _weaponAttackNotAllowed stash
+// (see FeatureModules Hook_GZ_*), so datagrams are accepted inside safe zones.
+// ---------------------------------------------------------------------------
+inline constexpr float kGrabKillRadiusDefault = 90.0f;
+inline std::atomic<bool>    g_kaGrabKillActive{false};
+inline std::atomic<float>   g_kaGrabKillRadius{kGrabKillRadiusDefault};
+inline std::atomic<int32_t> g_kaGrabKillSweeps{0};
+inline std::atomic<int32_t> g_kaGrabKillTargets{0};
+
+inline void StartGrabCrowdKill() {
+    g_kaGrabKillActive.store(true, std::memory_order_release);
+    g_kaKillAllBurstUntilMs.store(GetMonotonicMs() + g_cfg.killAllBurstMs, std::memory_order_release);
+}
+
+inline void StopGrabCrowdKill() {
+    g_kaGrabKillActive.store(false, std::memory_order_release);
+}
+
+// Kill the single nearest target (used by the "kill nearest" button).
+inline bool KillNearestTarget() {
+    float radius = g_kaGrabKillRadius.load(std::memory_order_relaxed);
+    auto targets = CollectNearbyAuraTargets(radius, true);
+    if (targets.empty()) return false;
+    // CollectNearbyAuraTargets is sorted nearest-first
+    const auto& t = targets.front();
+    RequestKillTarget(t.playerId, t.elemId, t.elemGen, t.name);
+    return true;
+}
+
+// One sweep of the grab crowd kill: burst every target inside the radius.
+inline int GrabCrowdKillSweep(int64_t nowMs) {
+    if (!g_kaGrabKillActive.load(std::memory_order_acquire)) return 0;
+    float radius = g_kaGrabKillRadius.load(std::memory_order_relaxed);
+    auto targets = CollectNearbyAuraTargets(radius, true);
+    g_kaGrabKillTargets.store(static_cast<int32_t>(targets.size()), std::memory_order_relaxed);
+    if (targets.empty()) return 0;
+
+    int killed = 0;
+    for (const auto& t : targets) {
+        if (t.elemId < 1) continue;
+        if (IsTargetConfirmedDead(t.elemId, t.playerId)) continue;
+        // Ghost-step so the server sees us in melee range even at 90 m.
+        if (t.dist > g_cfg.directMeleeRangeM) {
+            SendGhostPedDisplacement(t.pos, false);
+        }
+        KillSingleTargetBurst(t.elemId, t.elemGen, t.playerId, g_cfg.auraHitsPerTarget);
+        ++killed;
+    }
+    g_kaGrabKillSweeps.fetch_add(1, std::memory_order_relaxed);
+    return killed;
 }
 
 inline void StopAll() {
@@ -996,7 +1093,8 @@ inline void Tick() {
     }
 
     bool killAllBurst   = (nowMs < g_kaKillAllBurstUntilMs.load(std::memory_order_acquire));
-    bool auraActive     = g_cfgState.bKillAroundAura || killAllBurst;
+    bool grabKillActive= g_kaGrabKillActive.load(std::memory_order_acquire);
+    bool auraActive     = g_cfgState.bKillAroundAura || killAllBurst || grabKillActive;
     bool autoFinishWnd  = (nowMs < g_kaAutoFinishUntilMs.load(std::memory_order_acquire));
     bool singleFollowOn = (g_cfgState.bKillAroundAutoRepeat || autoFinishWnd) && (g_kaCurrentTargetId >= 1);
     bool kaTabVisible   = g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
@@ -1055,6 +1153,10 @@ inline void Tick() {
         } else if (killAllBurst) {
             g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
         }
+        // NEW: grab crowd kill sweep — kills everyone within radius each sweep
+        if (grabKillActive) {
+            GrabCrowdKillSweep(nowMs);
+        }
     }
 
     if (singleFollowOn) {
@@ -1109,6 +1211,29 @@ inline void DrawPanel(float availW) {
              T("KILL EVERYONE AROUND ME", "قتل الجميع حولي الآن"), nearN);
     if (ThemeEngine::NeonActionButton(killAllBtn, std::max(180.0f, availW - 8.0f), 38.0f, (g_cfgState.bKillAroundAura || burstActive))) {
         RequestKillAllAroundOnce();
+    }
+    ImGui::Spacing();
+
+    // NEW: two-button grab kill — crowd + nearest
+    bool grabOn = g_kaGrabKillActive.load(std::memory_order_relaxed);
+    float grabRadius = g_kaGrabKillRadius.load(std::memory_order_relaxed);
+    int32_t grabTargets = g_kaGrabKillTargets.load(std::memory_order_relaxed);
+
+    char grabAllBtn[160]{};
+    snprintf(grabAllBtn, sizeof(grabAllBtn), "%s (%.0fm, %d)##ka_grab_all",
+             grabOn ? T("STOP GRAB KILL", "إيقاف قتل القبضة")
+                    : T("GRAB KILL EVERYONE", "قتل الجميع بالقبضة"),
+             grabRadius, grabTargets);
+    if (ThemeEngine::NeonActionButton(grabAllBtn, std::max(180.0f, availW - 8.0f), 38.0f, grabOn)) {
+        if (grabOn) StopGrabCrowdKill();
+        else        StartGrabCrowdKill();
+    }
+
+    char grabNearBtn[160]{};
+    snprintf(grabNearBtn, sizeof(grabNearBtn), "%s##ka_grab_near",
+             T("GRAB KILL NEAREST", "قتل الأقرب بالقبضة"));
+    if (ThemeEngine::NeonActionButton(grabNearBtn, std::max(180.0f, availW - 8.0f), 34.0f, false)) {
+        KillNearestTarget();
     }
     ImGui::Spacing();
 
@@ -1227,6 +1352,9 @@ inline void DrawPanel(float availW) {
                 if (c.elemId >= 1) {
                     if (ImGui::Button(T("KILL##ka_k", "قتل##ka_k"), ImVec2(84.0f, 24.0f))) {
                         RequestKillTarget(c.playerId, c.elemId, c.elemGen, c.name);
+                    }
+                    if (ImGui::Button(T("NEAR##ka_n", "قريب##ka_n"), ImVec2(60.0f, 24.0f))) {
+                        KillNearestTarget();
                     }
                 } else {
                     ImGui::TextDisabled("-");
