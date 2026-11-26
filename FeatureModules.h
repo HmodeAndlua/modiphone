@@ -1016,26 +1016,31 @@ static void Hook_SkipLoseConscUpdate(void* self, float dt, void* method) {
     if (orig_SkipLoseConscUpdate) orig_SkipLoseConscUpdate(self, dt, method);
 }
 
-// KillAround Datagram hooks (managed interface / vtable fallbacks)
+// KillAround Datagram hooks (unbox-normalized so orig_* unboxed struct methods always receive T*)
 static void Hook_PedDispRead(void* self, void* reader, void* method) {
-    if (orig_PedDispRead) orig_PedDispRead(self, reader, method);
-    KillAround::OnPedDisplacementRead(self);
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+    if (orig_PedDispRead) orig_PedDispRead(unboxed ? unboxed : self, reader, method);
+    KillAround::OnPedDisplacementRead(unboxed ? unboxed : self);
 }
 static void Hook_PedDispWrite(void* self, void* writer, void* method) {
-    KillAround::OnPedDisplacementWrite(self);
-    if (orig_PedDispWrite) orig_PedDispWrite(self, writer, method);
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+    KillAround::OnPedDisplacementWrite(unboxed ? unboxed : self, writer);
+    if (orig_PedDispWrite) orig_PedDispWrite(unboxed ? unboxed : self, writer, method);
 }
 static void Hook_PedDeadRead(void* self, void* reader, void* method) {
-    if (orig_PedDeadRead) orig_PedDeadRead(self, reader, method);
-    KillAround::OnPedDeadRead(self);
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
+    if (orig_PedDeadRead) orig_PedDeadRead(unboxed ? unboxed : self, reader, method);
+    KillAround::OnPedDeadRead(unboxed ? unboxed : self);
 }
 static void Hook_MeleeAtkRead(void* self, void* reader, void* method) {
-    if (orig_MeleeAtkRead) orig_MeleeAtkRead(self, reader, method);
-    KillAround::OnMeleeAttackRead(self);
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    if (orig_MeleeAtkRead) orig_MeleeAtkRead(unboxed ? unboxed : self, reader, method);
+    KillAround::OnMeleeAttackRead(unboxed ? unboxed : self);
 }
 static void Hook_MeleeReqWrite(void* self, void* writer, void* method) {
-    KillAround::OnMeleeRequestWrite(self);
-    if (orig_MeleeReqWrite) orig_MeleeReqWrite(self, writer, method);
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+    KillAround::OnMeleeRequestWrite(unboxed ? unboxed : self, writer);
+    if (orig_MeleeReqWrite) orig_MeleeReqWrite(unboxed ? unboxed : self, writer, method);
 }
 static void Hook_WeaponProduceMeleeUpdate(void* self, float dt, void* method) {
     if (SafeMem::IsPlausiblePtr(self))
@@ -3905,6 +3910,8 @@ inline void RefreshWorldSnapshot(float dt) {
 
     // Populate ESP / Aimbot / Spectate / KillAround / Player-List Snapshot
     bool killAroundActive = g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
+                            KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
+                            KillAround::g_kaSeqUiActive.load(std::memory_order_relaxed) ||
                             (KillAround::GetMonotonicMs() < KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed)) ||
                             (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
                              g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
@@ -4261,6 +4268,8 @@ inline void RefreshWorldSnapshot(float dt) {
     // Gated Server-Wide All Players scan (~2Hz) — runs when FreeCam, Live Players, or Kill Around is open/active!
     if ((menuOpen && ((uiTab == 1 && uiSub == 1) || (uiTab == 3 && uiSub == 2) || (uiTab == 0 && uiSub == 3))) ||
         g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
+        KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
+        KillAround::g_kaSeqUiActive.load(std::memory_order_relaxed) ||
         KillAround::GetMonotonicMs() < KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed)) {
         static double s_lastServerPlScan = 0.0;
         if (now - s_lastServerPlScan >= 0.45) {

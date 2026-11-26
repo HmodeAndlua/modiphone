@@ -1,7 +1,10 @@
 #pragma once
 // KillAround.h — iOS 1.4.1 Sequential Close + Remote Fist Combat Engine
-// Verified against dump1.4.1.cpp (MetaClientWrapper, WeaponProduceAttackMeleeSystem,
-// MeleeCombatAttackRequestSendSystem, ElementSendDisplacementSystem, PedDead, Health).
+// Verified against dump1.4.1.cpp:
+// - Non-generic AOT-safe FlakeFlow wire sender (MetaTypeInfo.IdToInfo + IBNet_Writer + HostCommandWriter.WriteSend)
+// - Full Fist Combat Mode lifecycle (MeleeCombatModeStartDatagram + MeleeCombatMode + InMeleeBattle + MeleeCombo)
+// - 2-Phase Standing Combo -> Knockout -> Ground Finisher (kAtkFinisher) sequential 1-by-1 elimination
+// - Stepped Ghost Displacement (1.9m..80m) with live remote_time monotonicity & clean origin restore.
 #include <time.h>
 #include <unordered_set>
 #include "imgui.h"
@@ -12,30 +15,30 @@
 namespace KillAround {
 
 struct Tunables {
-    float   directMeleeRangeM      = 4.2f;
-    float   ghostStepChunkM        = 12.0f;
-    float   ghostHitOffsetM        = 0.50f;
+    float   directMeleeRangeM      = 1.90f; // true point-blank fist hit radius (fixes 2.0m..4.2m server range deadzone)
+    float   ghostStepChunkM        = 8.50f; // smooth per-hop displacement step
+    float   ghostHitOffsetM        = 0.85f; // optimal stand distance in front of target
     float   stepApproachOffsetM    = 0.85f;
-    int32_t strikeIntervalMs       = 85;    // >=1 game tick so MeleeCombatAttackRequestSendSystem drains each request
-    int32_t ghostSettleLeadMs      = 45;    // brief sync lead after >directRange ghost jump so strike #0 lands
-    int32_t maxStrikesPerTarget    = 14;
-    int32_t maxMsPerTarget         = 1600;
-    int32_t skipUnkillableMs       = 1400;
-    int32_t singleFollowIntervalMs = 110;
-    int32_t killAllBurstMs         = 18000; // hard safety ceiling for clearing large groups sequentially
-    int32_t autoFinishWindowMs     = 2800;
+    int32_t strikeIntervalMs       = 90;    // optimal fist strike cadence (~11 Hz)
+    int32_t koStrikeIntervalMs     = 115;   // finisher cadence during KnockoutFinisherDelay window
+    int32_t ghostSettleLeadMs      = 55;    // server arrival lead after >1.9m ghost step before strike #0
+    int32_t maxStrikesPerTarget    = 48;    // enough for 100 HP -> KO -> KnockoutFinisherDelay -> Finisher -> Dead
+    int32_t maxMsPerTarget         = 5200;  // full standing + KO + finisher window per player
+    int32_t skipUnkillableMs       = 1600;
+    int32_t singleFollowIntervalMs = 95;
+    int32_t killAllBurstMs         = 35000; // ceiling for clearing multi-player groups sequentially 1-by-1
+    int32_t autoFinishWindowMs     = 5200;
     int32_t deadCooldownMs         = 5500;
     int32_t pedStaleMs             = 10000;
-    int32_t ghostHoldMs            = 260;
-    int32_t stepHoldMs             = 260;
-    int32_t maxGhostHopsPerStrike  = 6;
+    int32_t ghostHoldMs            = 750;   // keeps server position locked at target between strikes
+    int32_t stepHoldMs             = 350;
+    int32_t maxGhostHopsPerStrike  = 10;    // covers up to 85m cleanly in <=8.5m increments
 };
 
 inline Tunables g_cfg{};
 
 #pragma pack(push, 1)
 // dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Datagrams.MeleeWeaponAttackRequestDatagram (0x38 = 56 bytes, dump1.4.1.cpp L101744)
-// Note: System.DateTime has a single 8-byte ulong field (_dateData @ 0x0, L892139), so unboxed size is 0x38.
 struct MeleeWeaponAttackRequestDatagram {
     int32_t  attacker_id;   // 0x00 EntityIdModel ElementId.Id
     int32_t  attacker_gen;  // 0x04 EntityIdModel ElementId.Gen
@@ -125,6 +128,29 @@ struct MeleeAttackRequestSendComponent {
 };
 static_assert(sizeof(MeleeAttackRequestSendComponent) == 0x30, "MeleeAttackRequestSendComponent must be 0x30");
 
+// dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Components.InMeleeBattle (0x10 = 16 bytes, dump1.4.1.cpp L426406)
+struct InMeleeBattleComponent {
+    int64_t currentTarget;     // 0x00 Scellecs.Morpeh.Entity
+    float   battleTimer;       // 0x08
+    uint8_t pad_0c[4];
+};
+static_assert(sizeof(InMeleeBattleComponent) == 0x10, "InMeleeBattleComponent must be 0x10");
+
+// FlakeFlow.MetaPeer (0x08 bytes, dump1.4.1.cpp L1435300)
+struct FlakeMetaPeerVal {
+    int32_t id;
+    int32_t gen;
+};
+static_assert(sizeof(FlakeMetaPeerVal) == 0x08, "FlakeMetaPeerVal must be 0x08");
+
+// System.ArraySegment<byte> unboxed layout (0x10 bytes, dump1.4.1.cpp L890276)
+struct ByteArraySegmentVal {
+    void*   array;
+    int32_t offset;
+    int32_t count;
+};
+static_assert(sizeof(ByteArraySegmentVal) == 0x10, "ByteArraySegmentVal must be 0x10");
+
 struct ElementIdModelVal {
     int32_t id;
     int32_t gen;
@@ -190,7 +216,10 @@ struct SequentialActiveTarget {
     int64_t     startedMs = 0;
     int64_t     lastStrikeMs = 0;
     int64_t     readyToStrikeAtMs = 0;
+    int64_t     koEnteredMs = 0;
+    uint64_t    comboTimestamp = 0;
     int32_t     strikesSent = 0;
+    int32_t     koStrikesSent = 0;
     bool        ghostAligned = false;
 };
 
@@ -223,6 +252,7 @@ inline std::atomic<int32_t>  g_kaLastSendError{0};
 inline std::atomic<int32_t>  g_kaLastNearbyCount{0};
 inline std::atomic<int32_t>  g_kaAuraSweepCount{0};
 inline std::atomic<int32_t>  g_kaMeleeOursFlag{0};
+inline std::atomic<int32_t>  g_kaSendingOwnDgram{0};
 inline std::atomic<int32_t>  g_kaKillAllSeqIdx{0};
 inline std::atomic<int64_t>  g_kaKillAllSeqMs{0};
 inline std::atomic<int32_t>  g_kaKillAllSeqTotal{0};
@@ -237,19 +267,26 @@ inline std::atomic<bool>     g_kaHasMeleeTemplate{false};
 inline std::atomic<bool>     g_kaSeqUiActive{false};
 inline std::atomic<int32_t>  g_kaSeqUiStrikes{0};
 inline std::atomic<int32_t>  g_kaSeqUiElemId{0};
+inline std::atomic<int32_t>  g_kaSeqUiHp{100};
 inline std::mutex            g_kaUiNameMutex;
 inline std::string           g_kaUiTargetName;
 inline std::string           g_kaReqTargetName;
 
-// Live game system instances captured cleanly via OnUpdate hooks in FeatureModules.h
+// Live game system instances resolved from FeatureRunner / OnUpdate hooks
 inline std::atomic<void*>    g_kaWeaponProduceMeleeSys{nullptr};
 inline std::atomic<void*>    g_kaElemSendDispSys{nullptr};
 inline std::atomic<void*>    g_kaMeleeReqSendSys{nullptr};
+inline std::atomic<void*>    g_kaMeleeModeActSys{nullptr};
 
 // Cached per-world / per-runtime IL2CPP handles & stashes
 inline void*                 g_kaMeleeReqSendStash = nullptr;
+inline void*                 g_kaMeleeCombatModeStash = nullptr;
+inline void*                 g_kaInMeleeBattleStash = nullptr;
+inline void*                 g_kaMeleeComboStash = nullptr;
+inline void*                 g_kaWeaponNotAllowedStash = nullptr;
 inline void*                 g_kaPedDeadTagStash = nullptr;
 inline void*                 g_kaPedViewMeleeKoStash = nullptr;
+inline void*                 g_kaMeleeKoHitStash = nullptr;
 inline void*                 g_kaSendAttackRequestMI = nullptr;
 inline void*                 g_kaSendPedDispMI = nullptr;
 inline void*                 g_kaGetServerTimeMI = nullptr;
@@ -257,6 +294,39 @@ inline void*                 g_kaClsPedDisp = nullptr;
 inline void*                 g_kaClsPedDead = nullptr;
 inline void*                 g_kaClsMeleeAtk = nullptr;
 inline void*                 g_kaClsMeleeReq = nullptr;
+
+// Non-generic FlakeFlow AOT wire sender handles
+enum class WireHeaderMode : int32_t {
+    kAutoWriteULong = 0,
+    kVerifiedWriteULong = 1,
+    kRaw8ByteLE = 2,
+    kPrefixPlus8ByteLE = 3
+};
+
+struct DatagramSenderEntry {
+    const char* name = nullptr;
+    void*       dgramKlass = nullptr;
+    void*       writeMI = nullptr;
+    uint64_t    packetId = 0;
+    uint8_t     netChannel = 16; // 16 = Reliable, 32 = Unreliable
+    bool        metaReady = false;
+    int64_t     lastFailMs = 0;
+};
+
+inline DatagramSenderEntry   g_kaSenders[16]{};
+inline int                   g_kaSenderCount = 0;
+inline bool                  g_kaMetaWarmupCalled = false;
+inline uint32_t              g_kaOurWriterGch = 0;
+inline void*                 g_kaWriterCls = nullptr;
+inline void*                 g_kaWriterResetMI = nullptr;
+inline void*                 g_kaWriterToSegMI = nullptr;
+inline void*                 g_kaWriteULongMI = nullptr;
+inline void*                 g_kaHostWriteSendMI = nullptr;
+inline void*                 g_kaPeerIsAssignedMI = nullptr;
+inline void*                 g_kaPeerGetMetaPeerMI = nullptr;
+inline std::atomic<int32_t>  g_kaWireHdrMode{static_cast<int32_t>(WireHeaderMode::kAutoWriteULong)};
+inline uint8_t               g_kaWirePrefixBytes[8]{};
+inline int32_t               g_kaWirePrefixLen = 0;
 
 inline uint8_t     g_kaPedDispTemplate[64]{};
 inline uint8_t     g_kaMeleeTemplate[64]{};
@@ -268,6 +338,7 @@ inline bool        g_kaStepActive = false;
 inline int64_t     g_kaStepReturnAtMs = 0;
 inline Vec3        g_kaStepOriginPos{};
 inline bool        g_kaCombatActive = false;
+inline int64_t     g_kaCombatModeLastSentMs = 0;
 inline int64_t     g_kaCombatFinishAtMs = 0;
 inline int32_t     g_kaCurrentTargetId = 0;
 inline int32_t     g_kaCurrentTargetGen = 1;
@@ -286,18 +357,6 @@ inline int32_t     g_kaRecentWriteIdx = 0;
 inline std::vector<NamedTargetCandidate> g_kaWaveQueue;
 inline SequentialActiveTarget            g_kaActiveSeq{};
 inline int64_t                           g_kaWaveSessionStartMs = 0;
-
-struct DatagramSenderEntry {
-    const char* name = nullptr;
-    uint32_t    methodGch = 0;
-    void*       dgramKlass = nullptr;
-    int64_t     lastFailMs = 0;
-};
-
-inline DatagramSenderEntry g_kaSenders[16]{};
-inline int                 g_kaSenderCount = 0;
-inline void*               g_kaSysObjKlass = nullptr;
-inline void*               g_kaMethodBaseInvoke = nullptr;
 
 inline void* ResolveMetaClientWrapper() {
     Morpeh::RefreshStoragesIfNeeded();
@@ -350,9 +409,11 @@ inline void EnsureWorldFreshness() {
     g_kaSeqUiActive.store(false, std::memory_order_release);
     g_kaSeqUiStrikes.store(0, std::memory_order_release);
     g_kaSeqUiElemId.store(0, std::memory_order_release);
+    g_kaSeqUiHp.store(100, std::memory_order_release);
     g_kaStepActive = false;
     g_kaStepReturnAtMs = 0;
     g_kaCombatActive = false;
+    g_kaCombatModeLastSentMs = 0;
     g_kaCombatFinishAtMs = 0;
     g_kaCurrentTargetId = 0;
     g_kaAutoFinishUntilMs.store(0, std::memory_order_release);
@@ -366,9 +427,15 @@ inline void EnsureWorldFreshness() {
     g_kaWeaponProduceMeleeSys.store(nullptr, std::memory_order_release);
     g_kaElemSendDispSys.store(nullptr, std::memory_order_release);
     g_kaMeleeReqSendSys.store(nullptr, std::memory_order_release);
+    g_kaMeleeModeActSys.store(nullptr, std::memory_order_release);
     g_kaMeleeReqSendStash = nullptr;
+    g_kaMeleeCombatModeStash = nullptr;
+    g_kaInMeleeBattleStash = nullptr;
+    g_kaMeleeComboStash = nullptr;
+    g_kaWeaponNotAllowedStash = nullptr;
     g_kaPedDeadTagStash = nullptr;
     g_kaPedViewMeleeKoStash = nullptr;
+    g_kaMeleeKoHitStash = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_kaMutex);
         g_kaTracked.clear();
@@ -376,7 +443,11 @@ inline void EnsureWorldFreshness() {
 }
 
 inline void ResolveSystemsFromFeatureRunner() {
-    if (!Il2Cpp::Init() || !Il2Cpp::IsUnityNativeAlive(Morpeh::g_stashes.realInitializer)) return;
+    if (!Il2Cpp::Init()) return;
+    if (!Il2Cpp::IsUnityNativeAlive(Morpeh::g_stashes.realInitializer)) {
+        Morpeh::RefreshStoragesIfNeeded();
+    }
+    if (!Il2Cpp::IsUnityNativeAlive(Morpeh::g_stashes.realInitializer)) return;
     void* frCls = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh", "FeatureRunner");
     if (!SafeMem::IsPlausiblePtr(frCls)) return;
 
@@ -409,14 +480,22 @@ inline void ResolveSystemsFromFeatureRunner() {
             }
         }
     }
-    if (!SafeMem::IsPlausiblePtr(g_kaMeleeReqSendSys.load(std::memory_order_relaxed))) {
-        if (void* mfCls = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature", "MeleeCombatFeature")) {
-            size_t offFeat = Il2Cpp::FieldOffset(frCls, "_meleeCombatFeature", 0x3228);
-            size_t offSys  = Il2Cpp::StructFieldOffset(mfCls, "_meleeCombatRequestSendSystem", 0xC0);
+    if (void* mfCls = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature", "MeleeCombatFeature")) {
+        size_t offFeat = Il2Cpp::FieldOffset(frCls, "_meleeCombatFeature", 0x3228);
+        if (!SafeMem::IsPlausiblePtr(g_kaMeleeReqSendSys.load(std::memory_order_relaxed))) {
+            size_t offSys = Il2Cpp::StructFieldOffset(mfCls, "_meleeCombatRequestSendSystem", 0xC0);
             void* sys = SafeMem::PtrAt(runner, offFeat + offSys);
             void* sysCls = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Systems", "MeleeCombatAttackRequestSendSystem");
             if (SafeMem::IsPlausiblePtr(sys) && (!sysCls || SafeMem::PtrAt(sys, 0) == sysCls)) {
                 g_kaMeleeReqSendSys.store(sys, std::memory_order_release);
+            }
+        }
+        if (!SafeMem::IsPlausiblePtr(g_kaMeleeModeActSys.load(std::memory_order_relaxed))) {
+            size_t offAct = Il2Cpp::StructFieldOffset(mfCls, "_meleeCombatModeActivateSystem", 0x30);
+            void* sys = SafeMem::PtrAt(runner, offFeat + offAct);
+            void* sysCls = Il2Cpp::FindClass("dev.Scripts.ECS.Morpeh.Features.MeleeCombatFeature.Systems", "MeleeCombatModeActivateSystem");
+            if (SafeMem::IsPlausiblePtr(sys) && (!sysCls || SafeMem::PtrAt(sys, 0) == sysCls)) {
+                g_kaMeleeModeActSys.store(sys, std::memory_order_release);
             }
         }
     }
@@ -427,35 +506,61 @@ inline void EnsureMeleeStashesResolved() {
     void* w = Morpeh::g_stashes.cachedWorld;
     if (!SafeMem::IsPlausiblePtr(w)) return;
     const auto& cfg = Offsets::g_cfg;
-    if (!g_kaMeleeReqSendStash) {
+
+    if (!g_kaMeleeReqSendStash)
         g_kaMeleeReqSendStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), "MeleeAttackRequestSend");
-    }
-    if (!g_kaMeleeReqSendStash) {
-        if (void* meleeSys = g_kaWeaponProduceMeleeSys.load(std::memory_order_acquire)) {
-            void* cls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(meleeSys) : nullptr;
+    if (!g_kaMeleeCombatModeStash)
+        g_kaMeleeCombatModeStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), "MeleeCombatMode");
+    if (!g_kaInMeleeBattleStash)
+        g_kaInMeleeBattleStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), "InMeleeBattle");
+    if (!g_kaMeleeComboStash)
+        g_kaMeleeComboStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), "MeleeCombo");
+    if (!g_kaMeleeKoHitStash)
+        g_kaMeleeKoHitStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), "MeleeKnockoutHit");
+    if (!g_kaPedDeadTagStash)
+        g_kaPedDeadTagStash = Morpeh::FetchComponentStash(w, cfg.nsPedStatesComponents.c_str(), "PedDead");
+    if (!g_kaPedViewMeleeKoStash)
+        g_kaPedViewMeleeKoStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), cfg.compPedViewMeleeKo.c_str());
+    if (!g_kaWeaponNotAllowedStash)
+        g_kaWeaponNotAllowedStash = Morpeh::FetchComponentStash(w, "dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Components", "WeaponAttackNotAllowed");
+
+    if (void* meleeSys = g_kaWeaponProduceMeleeSys.load(std::memory_order_acquire)) {
+        void* cls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(meleeSys) : nullptr;
+        if (!g_kaMeleeReqSendStash) {
             void* st = SafeMem::PtrAt(meleeSys, Il2Cpp::FieldOffset(cls, "_meleeAttackRequestSend", 0xE0));
             if (Il2Cpp::IsUnityObjectSafe(st)) g_kaMeleeReqSendStash = st;
         }
-    }
-    if (!g_kaMeleeReqSendStash) {
-        if (void* reqSys = g_kaMeleeReqSendSys.load(std::memory_order_acquire)) {
-            void* cls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(reqSys) : nullptr;
-            void* st = SafeMem::PtrAt(reqSys, Il2Cpp::FieldOffset(cls, "_meleeAttackRequestSend", 0x28));
-            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaMeleeReqSendStash = st;
+        if (!g_kaMeleeComboStash) {
+            void* st = SafeMem::PtrAt(meleeSys, Il2Cpp::FieldOffset(cls, "_meleeCombo", 0xD0));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaMeleeComboStash = st;
         }
-    }
-    if (!g_kaPedDeadTagStash) {
-        g_kaPedDeadTagStash = Morpeh::FetchComponentStash(w, cfg.nsPedStatesComponents.c_str(), "PedDead");
-    }
-    if (!g_kaPedDeadTagStash) {
-        if (void* meleeSys = g_kaWeaponProduceMeleeSys.load(std::memory_order_acquire)) {
-            void* cls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(meleeSys) : nullptr;
+        if (!g_kaInMeleeBattleStash) {
+            void* st = SafeMem::PtrAt(meleeSys, Il2Cpp::FieldOffset(cls, "_inMeleeBattle", 0x90));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaInMeleeBattleStash = st;
+        }
+        if (!g_kaWeaponNotAllowedStash) {
+            void* st = SafeMem::PtrAt(meleeSys, Il2Cpp::FieldOffset(cls, "_weaponAttackNotAllowed", 0xE8));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaWeaponNotAllowedStash = st;
+        }
+        if (!g_kaPedDeadTagStash) {
             void* st = SafeMem::PtrAt(meleeSys, Il2Cpp::FieldOffset(cls, "_pedDead", 0x108));
             if (Il2Cpp::IsUnityObjectSafe(st)) g_kaPedDeadTagStash = st;
         }
     }
-    if (!g_kaPedViewMeleeKoStash) {
-        g_kaPedViewMeleeKoStash = Morpeh::FetchComponentStash(w, cfg.nsMeleeCombatComps.c_str(), cfg.compPedViewMeleeKo.c_str());
+    if (void* actSys = g_kaMeleeModeActSys.load(std::memory_order_acquire)) {
+        void* cls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(actSys) : nullptr;
+        if (!g_kaMeleeCombatModeStash) {
+            void* st = SafeMem::PtrAt(actSys, Il2Cpp::FieldOffset(cls, "_meleeCombatMode", 0x28));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaMeleeCombatModeStash = st;
+        }
+        if (!g_kaInMeleeBattleStash) {
+            void* st = SafeMem::PtrAt(actSys, Il2Cpp::FieldOffset(cls, "_inMeleeBattle", 0x30));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaInMeleeBattleStash = st;
+        }
+        if (!g_kaMeleeComboStash) {
+            void* st = SafeMem::PtrAt(actSys, Il2Cpp::FieldOffset(cls, "_meleeCombo", 0x38));
+            if (Il2Cpp::IsUnityObjectSafe(st)) g_kaMeleeComboStash = st;
+        }
     }
 }
 
@@ -522,7 +627,6 @@ inline int64_t ResolveTargetPedEntity(int32_t elemId, int32_t& ioElemGen, int32_
             }
         }
     }
-    // Native ECS scan fallback over ElementId stash (covers streamed NPCs and unmapped peds)
     if (elemId >= 1 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.elementIdStash)) {
         int64_t matchedEnt = 0;
         Morpeh::ForEachSlotEntityId(Morpeh::g_stashes.elementIdStash, [&](int32_t slotId, int32_t) {
@@ -600,18 +704,262 @@ inline bool ResolveLocalElementId() {
     return false;
 }
 
+// ============================================================================
+// Non-Generic AOT-Safe FlakeFlow Wire Sender (Zero MakeGenericMethod!)
+// ============================================================================
+inline void* EnsureOurIBNetWriter() {
+    if (!Il2Cpp::Init() || !Il2Cpp::g_api.object_new || !Il2Cpp::g_api.gchandle_new || !Il2Cpp::g_api.gchandle_get_target)
+        return nullptr;
+    if (g_kaOurWriterGch != 0) {
+        void* existing = Il2Cpp::g_api.gchandle_get_target(g_kaOurWriterGch);
+        if (Il2Cpp::IsUnityObjectSafe(existing)) return existing;
+        g_kaOurWriterGch = 0;
+    }
+    if (!g_kaWriterCls) {
+        g_kaWriterCls = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "IBNet_Writer");
+    }
+    if (!SafeMem::IsPlausiblePtr(g_kaWriterCls)) return nullptr;
+    if (!g_kaWriterResetMI)
+        g_kaWriterResetMI = Il2Cpp::g_api.class_get_method_from_name(g_kaWriterCls, "Reset", 0);
+    if (!g_kaWriterToSegMI)
+        g_kaWriterToSegMI = Il2Cpp::g_api.class_get_method_from_name(g_kaWriterCls, "ToArraySegment", 0);
+    if (!g_kaWriteULongMI)
+        g_kaWriteULongMI = Il2Cpp::ResolveMethod("dev.Scripts.Networking.IBNet", "NumberSerializer", "WriteULong", 2);
+
+    void* ctorMI = Il2Cpp::g_api.class_get_method_from_name(g_kaWriterCls, ".ctor", 1);
+    if (!SafeMem::IsPlausiblePtr(ctorMI)) return nullptr;
+
+    void* obj = nullptr;
+    TCFlyGuard::TryRun([&]() {
+        obj = Il2Cpp::g_api.object_new(g_kaWriterCls);
+        if (SafeMem::IsPlausiblePtr(obj)) {
+            int32_t cap = 512;
+            void* args[1] = { &cap };
+            void* exc = nullptr;
+            Il2Cpp::SafeInvoke(ctorMI, obj, args, &exc);
+            if (!exc) {
+                g_kaOurWriterGch = Il2Cpp::g_api.gchandle_new(obj, false);
+            } else {
+                obj = nullptr;
+            }
+        }
+    });
+    return (g_kaOurWriterGch != 0) ? obj : nullptr;
+}
+
+inline bool ResolveDatagramMetaInfo(const char* ns, const char* dgramName, DatagramSenderEntry& entry) {
+    if (entry.metaReady && entry.packetId != 0 && SafeMem::IsPlausiblePtr(entry.dgramKlass)) return true;
+    if (!Il2Cpp::Init() || !dgramName) return false;
+
+    if (!entry.dgramKlass) entry.dgramKlass = Il2Cpp::FindClass(ns, dgramName);
+    if (!SafeMem::IsPlausiblePtr(entry.dgramKlass)) return false;
+    if (!entry.writeMI) entry.writeMI = Il2Cpp::g_api.class_get_method_from_name(entry.dgramKlass, "Write", 1);
+    if (!SafeMem::IsPlausiblePtr(entry.writeMI)) return false;
+
+    void* mtiCls = Il2Cpp::FindClass("FlakeFlow", "MetaTypeInfo");
+    if (!SafeMem::IsPlausiblePtr(mtiCls)) return false;
+
+    void* dictObj = Il2Cpp::ResolveStaticClassFieldPtr("FlakeFlow", "MetaTypeInfo", "IdToInfo");
+    if (!Il2Cpp::IsUnityObjectSafe(dictObj) && !g_kaMetaWarmupCalled) {
+        g_kaMetaWarmupCalled = true;
+        if (void* warmMI = Il2Cpp::g_api.class_get_method_from_name(mtiCls, "Warmup", 0)) {
+            void* exc = nullptr;
+            Il2Cpp::SafeInvoke(warmMI, nullptr, nullptr, &exc);
+        }
+        dictObj = Il2Cpp::ResolveStaticClassFieldPtr("FlakeFlow", "MetaTypeInfo", "IdToInfo");
+    }
+    if (!Il2Cpp::IsUnityObjectSafe(dictObj)) return false;
+
+    void* dictCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(dictObj) : nullptr;
+    size_t offEntries = Il2Cpp::FieldOffset(dictCls, "_entries", 0x18);
+    size_t offCount   = Il2Cpp::FieldOffset(dictCls, "_count", 0x20);
+
+    void* entriesArr = SafeMem::PtrAt(dictObj, offEntries);
+    int32_t count = 0;
+    if ((!SafeMem::IsPlausiblePtr(entriesArr) || !SafeMem::ReadVal(reinterpret_cast<uint8_t*>(dictObj) + offCount, count) || count <= 0) &&
+        !g_kaMetaWarmupCalled) {
+        g_kaMetaWarmupCalled = true;
+        if (void* warmMI = Il2Cpp::g_api.class_get_method_from_name(mtiCls, "Warmup", 0)) {
+            void* exc = nullptr;
+            Il2Cpp::SafeInvoke(warmMI, nullptr, nullptr, &exc);
+        }
+        entriesArr = SafeMem::PtrAt(dictObj, offEntries);
+        SafeMem::ReadVal(reinterpret_cast<uint8_t*>(dictObj) + offCount, count);
+    }
+    if (!SafeMem::IsPlausiblePtr(entriesArr) || count <= 0)
+        return false;
+
+    int32_t arrLen = 0;
+    if (!SafeMem::ReadVal(reinterpret_cast<uint8_t*>(entriesArr) + Offsets::Morpeh::kIl2CppArrayLengthOff, arrLen) || arrLen <= 0)
+        return false;
+
+    int32_t elemStride = Il2Cpp::g_api.array_element_size ? Il2Cpp::g_api.array_element_size(entriesArr) : 24;
+    if (elemStride < 16 || elemStride > 64) elemStride = 24;
+
+    void* targetTypeObj = Il2Cpp::GetTypeObject(ns, dgramName);
+    size_t offType       = Il2Cpp::FieldOffset(mtiCls, "type", 0x10);
+    size_t offTypeName   = Il2Cpp::FieldOffset(mtiCls, "TypeName", 0x18);
+    size_t offPacketId   = Il2Cpp::FieldOffset(mtiCls, "PacketId", 0x20);
+    size_t offNetChannel = Il2Cpp::FieldOffset(mtiCls, "NetChannel", 0x28);
+
+    int32_t limit = std::min(count, std::min(arrLen, 4096));
+    uint8_t* dataBase = reinterpret_cast<uint8_t*>(entriesArr) + Offsets::Morpeh::kIl2CppArrayDataOff;
+    std::string suffixDot = std::string(".") + dgramName;
+
+    for (int32_t i = 0; i < limit; ++i) {
+        uint8_t* slot = dataBase + static_cast<size_t>(i) * static_cast<size_t>(elemStride);
+        int32_t hashCode = -1;
+        if (!SafeMem::ReadVal(slot, hashCode) || hashCode < 0) continue;
+        void* mtiObj = nullptr;
+        for (size_t wOff = 0; wOff + sizeof(void*) <= static_cast<size_t>(elemStride); wOff += sizeof(void*)) {
+            void* cand = SafeMem::PtrAt(slot, wOff);
+            if (SafeMem::IsPlausiblePtr(cand) && SafeMem::PtrAt(cand, 0) == mtiCls) {
+                mtiObj = cand;
+                break;
+            }
+        }
+        if (!mtiObj) continue;
+
+        bool matched = false;
+        void* entryTypeObj = SafeMem::PtrAt(mtiObj, offType);
+        if (SafeMem::IsPlausiblePtr(targetTypeObj) && entryTypeObj == targetTypeObj) {
+            matched = true;
+        } else {
+            std::string tName = Il2Cpp::ReadManagedString(SafeMem::PtrAt(mtiObj, offTypeName));
+            if (!tName.empty()) {
+                if (tName == dgramName ||
+                    (tName.size() >= suffixDot.size() &&
+                     tName.compare(tName.size() - suffixDot.size(), suffixDot.size(), suffixDot) == 0)) {
+                    matched = true;
+                }
+            }
+        }
+        if (matched) {
+            uint64_t pktId = 0;
+            uint8_t  chan  = 16;
+            SafeMem::ReadVal(reinterpret_cast<uint8_t*>(mtiObj) + offPacketId, pktId);
+            SafeMem::ReadVal(reinterpret_cast<uint8_t*>(mtiObj) + offNetChannel, chan);
+            if (pktId != 0) {
+                entry.packetId   = pktId;
+                entry.netChannel = (chan == 16 || chan == 32) ? chan : 16;
+                entry.metaReady  = true;
+                return true;
+            }
+        }
+    }
+
+    // Secondary Fnv1A64 fallback if dictionary scan missed
+    if (void* fnvMI = Il2Cpp::ResolveMethod("FlakeFlow", "HashUtility", "Fnv1A64", 1)) {
+        std::string full = (ns && ns[0]) ? (std::string(ns) + "." + dgramName) : std::string(dgramName);
+        if (void* sObj = Il2Cpp::g_api.string_new ? Il2Cpp::g_api.string_new(full.c_str()) : nullptr) {
+            void* args[1] = { sObj };
+            void* exc = nullptr;
+            if (void* boxed = Il2Cpp::SafeInvoke(fnvMI, nullptr, args, &exc)) {
+                if (!exc) {
+                    uint64_t h = 0;
+                    if (SafeMem::ReadVal(Il2Cpp::Unbox(boxed), h) && h != 0) {
+                        entry.packetId   = h;
+                        entry.netChannel = (std::strcmp(dgramName, "PedDisplacementSyncDatagram") == 0) ? 32 : 16;
+                        entry.metaReady  = true;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Auto-verifies exact FlakeFlow header framing from live game IBNet_Writer on first outgoing packet.
+inline void ObserveLiveWriterHeader(void* liveWriter, const char* ns, const char* dgramName) {
+    if (g_kaSendingOwnDgram.load(std::memory_order_relaxed) > 0) return;
+    if (g_kaWireHdrMode.load(std::memory_order_relaxed) != static_cast<int32_t>(WireHeaderMode::kAutoWriteULong)) return;
+    if (!Il2Cpp::IsUnityObjectSafe(liveWriter) || !Il2Cpp::Init()) return;
+
+    DatagramSenderEntry temp{};
+    temp.name = dgramName;
+    if (!ResolveDatagramMetaInfo(ns, dgramName, temp) || temp.packetId == 0) return;
+
+    void* wCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(liveWriter) : nullptr;
+    size_t offBuf = Il2Cpp::FieldOffset(wCls, "buffer", 0x10);
+    size_t offPos = Il2Cpp::FieldOffset(wCls, "position", 0x18);
+
+    void* bufArr = SafeMem::PtrAt(liveWriter, offBuf);
+    int32_t livePos = 0;
+    if (!SafeMem::IsPlausiblePtr(bufArr) || !SafeMem::ReadVal(reinterpret_cast<uint8_t*>(liveWriter) + offPos, livePos)) return;
+    if (livePos <= 0 || livePos > 16) return;
+
+    uint8_t liveBytes[16]{};
+    if (!SafeMem::Read(reinterpret_cast<uint8_t*>(bufArr) + Offsets::Morpeh::kIl2CppArrayDataOff, liveBytes, static_cast<size_t>(livePos)))
+        return;
+
+    // Check raw 8-byte little-endian PacketId
+    if (livePos == 8) {
+        uint64_t rawId = 0;
+        CopyRawBytes(&rawId, liveBytes, 8);
+        if (rawId == temp.packetId) {
+            g_kaWireHdrMode.store(static_cast<int32_t>(WireHeaderMode::kRaw8ByteLE), std::memory_order_release);
+            return;
+        }
+    }
+    // Check prefix + 8-byte little-endian PacketId
+    if (livePos > 8 && livePos <= 16) {
+        uint64_t tailId = 0;
+        CopyRawBytes(&tailId, liveBytes + (livePos - 8), 8);
+        if (tailId == temp.packetId) {
+            g_kaWirePrefixLen = livePos - 8;
+            CopyRawBytes(g_kaWirePrefixBytes, liveBytes, static_cast<size_t>(g_kaWirePrefixLen));
+            g_kaWireHdrMode.store(static_cast<int32_t>(WireHeaderMode::kPrefixPlus8ByteLE), std::memory_order_release);
+            return;
+        }
+    }
+    // Otherwise NumberSerializer.WriteULong (varint / custom IBNet ulong encoding)
+    g_kaWireHdrMode.store(static_cast<int32_t>(WireHeaderMode::kVerifiedWriteULong), std::memory_order_release);
+}
+
+inline bool WriteWirePacketHeader(void* writer, uint64_t packetId) {
+    if (!Il2Cpp::IsUnityObjectSafe(writer)) return false;
+    size_t offBuf = Il2Cpp::FieldOffset(g_kaWriterCls, "buffer", 0x10);
+    size_t offPos = Il2Cpp::FieldOffset(g_kaWriterCls, "position", 0x18);
+
+    WireHeaderMode mode = static_cast<WireHeaderMode>(g_kaWireHdrMode.load(std::memory_order_acquire));
+    if (mode == WireHeaderMode::kRaw8ByteLE || (mode == WireHeaderMode::kAutoWriteULong && !g_kaWriteULongMI)) {
+        void* bufArr = SafeMem::PtrAt(writer, offBuf);
+        if (!SafeMem::IsPlausiblePtr(bufArr)) return false;
+        int32_t newPos = 8;
+        if (!SafeMem::Write(reinterpret_cast<uint8_t*>(bufArr) + Offsets::Morpeh::kIl2CppArrayDataOff, &packetId, 8)) return false;
+        return SafeMem::Write(reinterpret_cast<uint8_t*>(writer) + offPos, &newPos, sizeof(int32_t));
+    }
+    if (mode == WireHeaderMode::kPrefixPlus8ByteLE && g_kaWirePrefixLen > 0 && g_kaWirePrefixLen <= 8) {
+        void* bufArr = SafeMem::PtrAt(writer, offBuf);
+        if (!SafeMem::IsPlausiblePtr(bufArr)) return false;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(bufArr) + Offsets::Morpeh::kIl2CppArrayDataOff;
+        if (!SafeMem::Write(dst, g_kaWirePrefixBytes, static_cast<size_t>(g_kaWirePrefixLen))) return false;
+        if (!SafeMem::Write(dst + g_kaWirePrefixLen, &packetId, 8)) return false;
+        int32_t newPos = g_kaWirePrefixLen + 8;
+        return SafeMem::Write(reinterpret_cast<uint8_t*>(writer) + offPos, &newPos, sizeof(int32_t));
+    }
+    if (SafeMem::IsPlausiblePtr(g_kaWriteULongMI)) {
+        uint64_t idArg = packetId;
+        void* args[2] = { writer, &idArg };
+        void* exc = nullptr;
+        Il2Cpp::SafeInvoke(g_kaWriteULongMI, nullptr, args, &exc);
+        return (exc == nullptr);
+    }
+    return false;
+}
+
 inline bool SendDatagram(const char* ns, const char* dgramName, const void* payload, size_t payloadSize) {
     if (!Il2Cpp::Init() || !dgramName || payloadSize > 0x200) {
         g_kaLastSendError.store(1, std::memory_order_relaxed);
         return false;
     }
-    void* clientWrapper = ResolveMetaClientWrapper();
-    if (!Il2Cpp::IsUnityObjectSafe(clientWrapper)) {
+    void* mcw = ResolveMetaClientWrapper();
+    if (!Il2Cpp::IsUnityObjectSafe(mcw)) {
         g_kaLastSendError.store(2, std::memory_order_relaxed);
         return false;
     }
-    if (!Il2Cpp::g_api.method_get_object || !Il2Cpp::g_api.array_new ||
-        !Il2Cpp::g_api.value_box || !Il2Cpp::g_api.gchandle_new || !Il2Cpp::g_api.gchandle_get_target) {
+    if (!Il2Cpp::g_api.value_box) {
         g_kaLastSendError.store(6, std::memory_order_relaxed);
         return false;
     }
@@ -628,8 +976,9 @@ inline bool SendDatagram(const char* ns, const char* dgramName, const void* payl
         entry = &g_kaSenders[g_kaSenderCount++];
         entry->name = dgramName;
     }
+
     int64_t nowMs = GetMonotonicMs();
-    if (entry->methodGch == 0 && entry->lastFailMs > 0 && (nowMs - entry->lastFailMs) < 1500) {
+    if (!entry->metaReady && entry->lastFailMs > 0 && (nowMs - entry->lastFailMs) < 1000) {
         return false;
     }
 
@@ -642,67 +991,141 @@ inline bool SendDatagram(const char* ns, const char* dgramName, const void* payl
     TCFlyGuard::TryRun([&]() {
         Il2Cpp::EnsureThreadAttached();
 
-        if (entry->methodGch == 0) {
-            const auto& cfg = Offsets::g_cfg;
-            void* wrapperKlass = Il2Cpp::FindClass(cfg.nsFlakeFlow.c_str(), cfg.clsMetaClientWrapper.c_str());
-            entry->dgramKlass = Il2Cpp::FindClass(ns, dgramName);
-            void* sysTypeKlass = Il2Cpp::FindClass("System", "Type");
-            if (!g_kaSysObjKlass) g_kaSysObjKlass = Il2Cpp::FindClass("System", "Object");
-            void* methodInfoKlass = Il2Cpp::FindClass("System.Reflection", "MethodInfo");
-            void* runtimeMethodKlass = Il2Cpp::FindClass("System.Reflection", "RuntimeMethodInfo");
-            void* methodBaseKlass = Il2Cpp::FindClass("System.Reflection", "MethodBase");
-
-            if (!wrapperKlass || !entry->dgramKlass || !sysTypeKlass || !g_kaSysObjKlass || !methodInfoKlass || !methodBaseKlass) {
-                errCode = 3;
-                return;
-            }
-            const void* sendMethod = Il2Cpp::g_api.class_get_method_from_name(wrapperKlass, "Send", 1);
-            void* sendMethodObj = sendMethod ? Il2Cpp::g_api.method_get_object(sendMethod, wrapperKlass) : nullptr;
-            void* makeGeneric = runtimeMethodKlass ? Il2Cpp::g_api.class_get_method_from_name(runtimeMethodKlass, "MakeGenericMethod", 1) : nullptr;
-            if (!makeGeneric) makeGeneric = Il2Cpp::g_api.class_get_method_from_name(methodInfoKlass, "MakeGenericMethod", 1);
-
-            void* typeArr = (sendMethodObj && makeGeneric) ? Il2Cpp::g_api.array_new(sysTypeKlass, 1) : nullptr;
-            void* dgramTypeObj = typeArr ? Il2Cpp::g_api.type_get_object(Il2Cpp::g_api.class_get_type(entry->dgramKlass)) : nullptr;
-            if (!typeArr || !dgramTypeObj) {
-                errCode = 3;
-                return;
-            }
-            void* slotAddr = reinterpret_cast<uint8_t*>(typeArr) + Offsets::Morpeh::kIl2CppArrayDataOff;
-            SafeMem::Write(slotAddr, &dgramTypeObj, sizeof(void*));
-            void* args[1] = { typeArr };
-            void* exc = nullptr;
-            void* concrete = Il2Cpp::g_api.runtime_invoke(makeGeneric, sendMethodObj, args, &exc);
-            if (!concrete || exc) {
-                errCode = 3;
-                return;
-            }
-            if (!g_kaMethodBaseInvoke) {
-                g_kaMethodBaseInvoke = Il2Cpp::g_api.class_get_method_from_name(methodBaseKlass, "Invoke", 2);
-            }
-            entry->methodGch = Il2Cpp::g_api.gchandle_new(concrete, false);
-            if (!entry->methodGch || !g_kaMethodBaseInvoke) {
-                errCode = 3;
-                return;
-            }
-        }
-
-        void* boxedDgram = Il2Cpp::g_api.value_box(entry->dgramKlass, boxBuf);
-        void* objArr = boxedDgram ? Il2Cpp::g_api.array_new(g_kaSysObjKlass, 1) : nullptr;
-        void* methodObj = objArr ? Il2Cpp::g_api.gchandle_get_target(entry->methodGch) : nullptr;
-        if (!boxedDgram || !objArr || !methodObj) {
+        if (!ResolveDatagramMetaInfo(ns, dgramName, *entry)) {
             errCode = 3;
             return;
         }
-        void* objSlotAddr = reinterpret_cast<uint8_t*>(objArr) + Offsets::Morpeh::kIl2CppArrayDataOff;
-        SafeMem::Write(objSlotAddr, &boxedDgram, sizeof(void*));
-        void* invokeArgs[2] = { clientWrapper, objArr };
-        void* exc = nullptr;
-        Il2Cpp::g_api.runtime_invoke(g_kaMethodBaseInvoke, methodObj, invokeArgs, &exc);
-        if (exc != nullptr) {
-            errCode = 4;
-        } else {
-            sendOk = true;
+
+        // Navigate MetaClientWrapper -> _client (FlakeFlowClient) -> _peerProvider & _commandWriter
+        void* mcwCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(mcw) : nullptr;
+        void* ffClient = SafeMem::PtrAt(mcw, Il2Cpp::FieldOffset(mcwCls, "_client", 0x38));
+        if (!Il2Cpp::IsUnityObjectSafe(ffClient)) {
+            errCode = 2;
+            return;
         }
+        void* ffcCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(ffClient) : nullptr;
+        void* peerProv  = SafeMem::PtrAt(ffClient, Il2Cpp::FieldOffset(ffcCls, "_peerProvider", 0x20));
+        void* cmdWriter = SafeMem::PtrAt(ffClient, Il2Cpp::FieldOffset(ffcCls, "_commandWriter", 0x30));
+        if (!Il2Cpp::IsUnityObjectSafe(peerProv) || !Il2Cpp::IsUnityObjectSafe(cmdWriter)) {
+            errCode = 2;
+            return;
+        }
+
+        void* ppCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(peerProv) : nullptr;
+        if (!g_kaPeerIsAssignedMI && ppCls)
+            g_kaPeerIsAssignedMI = Il2Cpp::g_api.class_get_method_from_name(ppCls, "IsAssigned", 0);
+        if (!g_kaPeerGetMetaPeerMI && ppCls)
+            g_kaPeerGetMetaPeerMI = Il2Cpp::g_api.class_get_method_from_name(ppCls, "get_MetaPeer", 0);
+
+        uint8_t assigned = 0;
+        SafeMem::ReadVal(reinterpret_cast<uint8_t*>(peerProv) + Il2Cpp::FieldOffset(ppCls, "_isAssigned", 0x10), assigned);
+        if (!assigned && g_kaPeerIsAssignedMI) {
+            void* exc = nullptr;
+            if (void* b = Il2Cpp::SafeInvoke(g_kaPeerIsAssignedMI, peerProv, nullptr, &exc)) {
+                if (!exc) SafeMem::ReadVal(Il2Cpp::Unbox(b), assigned);
+            }
+        }
+        if (!assigned) {
+            errCode = 2;
+            return;
+        }
+
+        FlakeMetaPeerVal metaPeer{};
+        bool gotPeer = false;
+        if (g_kaPeerGetMetaPeerMI) {
+            void* exc = nullptr;
+            if (void* b = Il2Cpp::SafeInvoke(g_kaPeerGetMetaPeerMI, peerProv, nullptr, &exc)) {
+                if (!exc && SafeMem::ReadVal(Il2Cpp::Unbox(b), metaPeer)) gotPeer = true;
+            }
+        }
+        if (!gotPeer) {
+            gotPeer = SafeMem::ReadVal(
+                reinterpret_cast<uint8_t*>(peerProv) + Il2Cpp::FieldOffset(ppCls, "<MetaPeer>k__BackingField", 0x14),
+                metaPeer);
+        }
+        if (!gotPeer) {
+            errCode = 2;
+            return;
+        }
+
+        if (!g_kaHostWriteSendMI) {
+            void* cwCls = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(cmdWriter) : nullptr;
+            if (cwCls) g_kaHostWriteSendMI = Il2Cpp::g_api.class_get_method_from_name(cwCls, "WriteSend", 3);
+        }
+        void* ourWriter = EnsureOurIBNetWriter();
+        if (!SafeMem::IsPlausiblePtr(g_kaHostWriteSendMI) || !Il2Cpp::IsUnityObjectSafe(ourWriter) || !g_kaWriterResetMI) {
+            errCode = 6;
+            return;
+        }
+
+        // 1. Reset writer & write PacketId header
+        void* exc = nullptr;
+        Il2Cpp::SafeInvoke(g_kaWriterResetMI, ourWriter, nullptr, &exc);
+        if (exc || !WriteWirePacketHeader(ourWriter, entry->packetId)) {
+            errCode = 4;
+            return;
+        }
+
+        size_t offPos = Il2Cpp::FieldOffset(g_kaWriterCls, "position", 0x18);
+        size_t offBuf = Il2Cpp::FieldOffset(g_kaWriterCls, "buffer", 0x10);
+        int32_t posBefore = 0;
+        SafeMem::ReadVal(reinterpret_cast<uint8_t*>(ourWriter) + offPos, posBefore);
+
+        // 2. Serialize datagram payload via non-generic Datagram.Write(IBNet_Writer)
+        void* boxedDgram = Il2Cpp::g_api.value_box(entry->dgramKlass, boxBuf);
+        if (!SafeMem::IsPlausiblePtr(boxedDgram)) {
+            errCode = 4;
+            return;
+        }
+        void* writeArgs[1] = { ourWriter };
+        exc = nullptr;
+        g_kaSendingOwnDgram.fetch_add(1, std::memory_order_acq_rel);
+        Il2Cpp::SafeInvoke(entry->writeMI, boxedDgram, writeArgs, &exc);
+        g_kaSendingOwnDgram.fetch_sub(1, std::memory_order_acq_rel);
+        if (exc) {
+            errCode = 4;
+            return;
+        }
+
+        int32_t posAfter = 0;
+        SafeMem::ReadVal(reinterpret_cast<uint8_t*>(ourWriter) + offPos, posAfter);
+        if (posAfter <= 0 || (payloadSize > 0 && posAfter <= posBefore)) {
+            errCode = 5;
+            return;
+        }
+
+        // 3. Build ArraySegment<byte> & dispatch HostCommandWriter.WriteSend(metaPeer, segment, netChannel)
+        ByteArraySegmentVal segVal{};
+        void* segArgPtr = nullptr;
+        if (g_kaWriterToSegMI) {
+            exc = nullptr;
+            if (void* boxedSeg = Il2Cpp::SafeInvoke(g_kaWriterToSegMI, ourWriter, nullptr, &exc)) {
+                void* unboxed = !exc ? Il2Cpp::Unbox(boxedSeg) : nullptr;
+                if (SafeMem::IsPlausiblePtr(unboxed) && SafeMem::IsPlausiblePtr(SafeMem::PtrAt(unboxed, 0))) {
+                    segArgPtr = unboxed;
+                }
+            }
+        }
+        if (!segArgPtr) {
+            segVal.array  = SafeMem::PtrAt(ourWriter, offBuf);
+            segVal.offset = 0;
+            segVal.count  = posAfter;
+            if (SafeMem::IsPlausiblePtr(segVal.array)) segArgPtr = &segVal;
+        }
+        if (!segArgPtr) {
+            errCode = 5;
+            return;
+        }
+
+        uint8_t chanVal = entry->netChannel;
+        void* sendArgs[3] = { &metaPeer, segArgPtr, &chanVal };
+        exc = nullptr;
+        Il2Cpp::SafeInvoke(g_kaHostWriteSendMI, cmdWriter, sendArgs, &exc);
+        if (exc) {
+            errCode = 4;
+            return;
+        }
+        sendOk = true;
     });
 
     if (!sendOk && errCode == 0) errCode = 5;
@@ -710,6 +1133,35 @@ inline bool SendDatagram(const char* ns, const char* dgramName, const void* payl
     else if (sendOk) entry->lastFailMs = 0;
     g_kaLastSendError.store(errCode, std::memory_order_relaxed);
     return sendOk;
+}
+
+inline int32_t GetTargetLiveHealth(int32_t elemId, int32_t playerId, int64_t pedEnt) {
+    if (pedEnt > 0) {
+        int32_t pedId = Morpeh::UnpackEntityId(pedEnt);
+        if (pedId >= 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.healthStash)) {
+            int32_t hp = 100;
+            if (void* hpPtr = Morpeh::Get(Morpeh::g_stashes.healthStash, pedId, sizeof(int32_t))) {
+                if (SafeMem::ReadVal(hpPtr, hp)) return hp;
+            }
+        }
+    }
+    if (elemId >= 1) {
+        std::lock_guard<std::mutex> lk(g_kaMutex);
+        auto it = g_kaTracked.find(elemId);
+        if (it != g_kaTracked.end() && (GetMonotonicMs() - it->second.lastSeenMs) < 5000) {
+            return it->second.hp;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_espMutex);
+        for (const auto& rp : g_renderPlayers) {
+            if (playerId > 0 && rp.playerId == playerId) return rp.health;
+        }
+        for (const auto& sp : g_allServerPlayers) {
+            if (playerId > 0 && sp.playerId == playerId && sp.isStreamed) return sp.health;
+        }
+    }
+    return 100;
 }
 
 inline bool IsTargetConfirmedDead(int32_t elemId, int32_t playerId, int64_t pedEnt = 0) {
@@ -720,35 +1172,33 @@ inline bool IsTargetConfirmedDead(int32_t elemId, int32_t playerId, int64_t pedE
         auto it = g_kaTracked.find(elemId);
         if (it != g_kaTracked.end()) {
             if (it->second.deadUntilMs > nowMs) return true;
-            if (it->second.hp <= 0 && (nowMs - it->second.lastSeenMs) < 3000) return true;
         }
     }
     if (pedEnt > 0) {
         if (g_kaPedDeadTagStash && Morpeh::Has(g_kaPedDeadTagStash, pedEnt)) return true;
-        int32_t pedId = Morpeh::UnpackEntityId(pedEnt);
-        if (pedId >= 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.healthStash)) {
-            int32_t hp = 0;
-            if (void* hpPtr = Morpeh::Get(Morpeh::g_stashes.healthStash, pedId, sizeof(int32_t))) {
-                if (SafeMem::ReadVal(hpPtr, hp) && hp <= 0) return true;
-            }
-        }
         int64_t viewEnt = Morpeh::GetViewEntity(pedEnt);
         if (viewEnt > 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.pedViewDeadStash) &&
             Morpeh::Has(Morpeh::g_stashes.pedViewDeadStash, viewEnt)) {
             return true;
         }
+        int32_t pedId = Morpeh::UnpackEntityId(pedEnt);
+        if (pedId >= 0 && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.healthStash)) {
+            int32_t hp = 100;
+            if (void* hpPtr = Morpeh::Get(Morpeh::g_stashes.healthStash, pedId, sizeof(int32_t))) {
+                // Note: In OneState RP, knocked-out players may still need a Finisher until PedDead/PedViewDead is set;
+                // only treat hp <= 0 as dead if NOT currently waiting in melee knockout!
+                if (SafeMem::ReadVal(hpPtr, hp) && hp <= 0) {
+                    bool inMeleeKo = (viewEnt > 0 && SafeMem::IsPlausiblePtr(g_kaPedViewMeleeKoStash) &&
+                                      Morpeh::Has(g_kaPedViewMeleeKoStash, viewEnt));
+                    if (!inMeleeKo) return true;
+                }
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_espMutex);
-        for (const auto& sp : g_allServerPlayers) {
-            if (playerId > 0 && sp.playerId == playerId) {
-                if (sp.isStreamed && sp.health <= 0) return true;
-            }
-        }
         for (const auto& rp : g_renderPlayers) {
-            if (playerId > 0 && rp.playerId == playerId) {
-                if (rp.dead || rp.health <= 0) return true;
-            }
+            if (playerId > 0 && rp.playerId == playerId && rp.dead) return true;
         }
     }
     return false;
@@ -757,6 +1207,9 @@ inline bool IsTargetConfirmedDead(int32_t elemId, int32_t playerId, int64_t pedE
 inline bool IsTargetInKnockout(int64_t pedEnt) {
     if (pedEnt <= 0) return false;
     EnsureMeleeStashesResolved();
+    if (SafeMem::IsPlausiblePtr(g_kaMeleeKoHitStash) && Morpeh::Has(g_kaMeleeKoHitStash, pedEnt)) {
+        return true;
+    }
     int64_t viewEnt = Morpeh::GetViewEntity(pedEnt);
     if (viewEnt <= 0) return false;
     if (SafeMem::IsPlausiblePtr(Morpeh::g_stashes.pedViewKoStash) &&
@@ -765,6 +1218,10 @@ inline bool IsTargetInKnockout(int64_t pedEnt) {
     }
     if (SafeMem::IsPlausiblePtr(g_kaPedViewMeleeKoStash) &&
         Morpeh::Has(g_kaPedViewMeleeKoStash, viewEnt)) {
+        return true;
+    }
+    if (SafeMem::IsPlausiblePtr(g_kaMeleeKoHitStash) &&
+        Morpeh::Has(g_kaMeleeKoHitStash, viewEnt)) {
         return true;
     }
     return false;
@@ -797,18 +1254,17 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         srvSnap = g_allServerPlayers;
         renderSnap = g_renderPlayers;
     }
-
     std::unordered_map<int32_t, TrackedElement> elemSnap;
     {
         std::lock_guard<std::mutex> lk(g_kaMutex);
         elemSnap = g_kaTracked;
     }
 
-    out.reserve(srvSnap.size() + renderSnap.size());
+    out.reserve(srvSnap.size() + renderSnap.size() + 16);
     std::unordered_set<int32_t> seenPeds;
     std::unordered_set<int32_t> seenElems;
-    seenPeds.reserve(srvSnap.size() + 16);
-    seenElems.reserve(srvSnap.size() + 16);
+    seenPeds.reserve(srvSnap.size() + 32);
+    seenElems.reserve(srvSnap.size() + 32);
 
     for (const auto& sp : srvSnap) {
         NamedTargetCandidate c{};
@@ -819,11 +1275,23 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         c.hp        = sp.health;
         c.pos       = sp.worldPos;
         c.hasPos    = (sp.isStreamed || (IsFiniteVec3(sp.worldPos) && (std::fabs(sp.worldPos.x) > 0.25f || std::fabs(sp.worldPos.z) > 0.25f)));
-        c.isDead    = (sp.isStreamed && sp.health <= 0);
+        c.isDead    = false;
         if (sp.pedEntityVal > 0) {
             ReadPedElementId(sp.pedEntityVal, c.elemId, c.elemGen);
-            if (sp.pedId >= 0) seenPeds.insert(sp.pedId);
+            int32_t pid = Morpeh::UnpackEntityId(sp.pedEntityVal);
+            if (pid >= 0) seenPeds.insert(pid);
             if (c.pedEnt == localPed) continue;
+            Vec3 liveP{};
+            int64_t view = Morpeh::GetViewEntity(sp.pedEntityVal);
+            if (view > 0) {
+                if (void* tr = Morpeh::GetEntityTransform(view)) {
+                    if (Il2Cpp::SafeGetTransformPos(tr, liveP) && IsFiniteVec3(liveP) &&
+                        (std::fabs(liveP.x) > 0.25f || std::fabs(liveP.z) > 0.25f)) {
+                        c.pos = liveP;
+                        c.hasPos = true;
+                    }
+                }
+            }
         }
         if (myElemId >= 1 && c.elemId == myElemId) continue;
 
@@ -831,19 +1299,15 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
             seenElems.insert(c.elemId);
             auto it = elemSnap.find(c.elemId);
             if (it != elemSnap.end()) {
-                if (it->second.deadUntilMs > nowMs || (it->second.hp <= 0 && (nowMs - it->second.lastSeenMs) < 3000)) {
-                    c.isDead = true;
-                }
-                if (it->second.isPed) {
-                    if (IsFiniteVec3(it->second.pos) && (std::fabs(it->second.pos.x) > 0.25f || std::fabs(it->second.pos.z) > 0.25f)) {
-                        c.pos = it->second.pos;
-                        c.hasPos = true;
-                    }
-                    if (it->second.hp <= 0) { c.hp = 0; c.isDead = true; }
+                if (it->second.deadUntilMs > nowMs) c.isDead = true;
+                if (it->second.isPed && !c.hasPos && IsFiniteVec3(it->second.pos) &&
+                    (std::fabs(it->second.pos.x) > 0.25f || std::fabs(it->second.pos.z) > 0.25f)) {
+                    c.pos = it->second.pos;
+                    c.hasPos = true;
                 }
             }
         }
-        if (!c.isDead && c.pedEnt > 0 && IsTargetConfirmedDead(c.elemId, c.playerId, c.pedEnt)) {
+        if (!c.isDead && IsTargetConfirmedDead(c.elemId, c.playerId, c.pedEnt)) {
             c.isDead = true;
             c.hp = 0;
         }
@@ -852,7 +1316,6 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         out.push_back(std::move(c));
     }
 
-    // Add unmapped nearby peds / NPCs / streamed players missing from srvSnap
     for (const auto& pl : renderSnap) {
         if (pl.entityId < 0 || pl.entityId == localPedId || pl.dead) continue;
         if (seenPeds.count(pl.entityId)) continue;
@@ -861,23 +1324,94 @@ inline std::vector<NamedTargetCandidate> CollectNamedPlayersSnapshot() {
         if (myElemId >= 1 && eId == myElemId) continue;
         if (seenElems.count(eId)) continue;
         seenElems.insert(eId);
+        seenPeds.insert(pl.entityId);
 
         NamedTargetCandidate c{};
         c.playerId = (pl.playerId >= 0) ? pl.playerId : -eId;
         c.elemId   = eId;
         c.elemGen  = eGen;
         c.pedEnt   = pl.pedEntityVal;
-        c.name     = !pl.name.empty() ? pl.name : ("Ped #" + std::to_string(eId));
+        c.name     = !pl.name.empty() ? pl.name : ("Player #" + std::to_string(eId));
         c.hp       = pl.health;
         c.pos      = pl.worldPos;
         c.hasPos   = IsFiniteVec3(pl.worldPos) && (std::fabs(pl.worldPos.x) > 0.25f || std::fabs(pl.worldPos.z) > 0.25f);
         c.isNpc    = (pl.playerId < 0);
-        c.isDead   = (pl.dead || pl.health <= 0);
-        auto it = elemSnap.find(eId);
-        if (it != elemSnap.end() && it->second.deadUntilMs > nowMs) c.isDead = true;
-        if (!c.isDead && c.pedEnt > 0 && IsTargetConfirmedDead(eId, c.playerId, c.pedEnt)) c.isDead = true;
+        c.isDead   = IsTargetConfirmedDead(eId, c.playerId, c.pedEnt);
         c.dist     = (hasMyPos && c.hasPos) ? Vec3Dist(myPos, pl.worldPos) : 99999.0f;
         out.push_back(std::move(c));
+    }
+
+    // Direct Morpeh ECS scan fallback: guarantees nearby players/NPCs are found even when ESP is OFF!
+    if (hasMyPos && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.elementIdStash) &&
+        SafeMem::IsPlausiblePtr(Morpeh::g_stashes.pedStash)) {
+        std::unordered_map<int32_t, int32_t> pedToPlayer;
+        if (SafeMem::IsPlausiblePtr(Morpeh::g_stashes.controlsEntityStash)) {
+            Morpeh::ForEachSlotEntityId(Morpeh::g_stashes.controlsEntityStash, [&](int32_t pSlot, int32_t) {
+                if (pSlot < 0) return;
+                int64_t ctrlEnt = 0;
+                if (void* cp = Morpeh::Get(Morpeh::g_stashes.controlsEntityStash, pSlot, sizeof(int64_t))) {
+                    if (SafeMem::ReadVal(cp, ctrlEnt) && ctrlEnt > 0) {
+                        int32_t pid = Morpeh::UnpackEntityId(ctrlEnt);
+                        if (pid >= 0) pedToPlayer[pid] = pSlot;
+                    }
+                }
+            });
+        }
+        Morpeh::ForEachSlotEntityId(Morpeh::g_stashes.elementIdStash, [&](int32_t slotId, int32_t) {
+            if (slotId < 0 || slotId == localPedId || seenPeds.count(slotId)) return;
+            int64_t ent = Morpeh::GetEntityById(slotId);
+            if (ent <= 0 || ent == localPed || !Morpeh::Has(Morpeh::g_stashes.pedStash, ent)) return;
+
+            ElementIdModelVal eid{};
+            if (void* ep = Morpeh::Get(Morpeh::g_stashes.elementIdStash, slotId, sizeof(ElementIdModelVal))) {
+                if (!SafeMem::ReadVal(ep, eid) || eid.id < 1) return;
+            } else {
+                return;
+            }
+            if ((myElemId >= 1 && eid.id == myElemId) || seenElems.count(eid.id)) return;
+
+            Vec3 p{};
+            bool okPos = false;
+            int64_t view = Morpeh::GetViewEntity(ent);
+            if (view > 0) {
+                if (void* tr = Morpeh::GetEntityTransform(view)) {
+                    if (Il2Cpp::SafeGetTransformPos(tr, p) && IsFiniteVec3(p) &&
+                        (std::fabs(p.x) > 0.25f || std::fabs(p.z) > 0.25f)) {
+                        okPos = true;
+                    }
+                }
+            }
+            if (!okPos && SafeMem::IsPlausiblePtr(Morpeh::g_stashes.positionStash)) {
+                if (void* pp = Morpeh::Get(Morpeh::g_stashes.positionStash, slotId, sizeof(Vec3))) {
+                    if (SafeMem::ReadVal(pp, p) && IsFiniteVec3(p) &&
+                        (std::fabs(p.x) > 0.25f || std::fabs(p.z) > 0.25f)) {
+                        okPos = true;
+                    }
+                }
+            }
+            if (!okPos) return;
+
+            auto pit = pedToPlayer.find(slotId);
+            int32_t plId = (pit != pedToPlayer.end()) ? pit->second : -eid.id;
+            if (IsTargetConfirmedDead(eid.id, plId, ent)) return;
+
+            seenElems.insert(eid.id);
+            seenPeds.insert(slotId);
+
+            NamedTargetCandidate c{};
+            c.playerId = plId;
+            c.elemId   = eid.id;
+            c.elemGen  = (eid.gen > 0) ? eid.gen : 1;
+            c.pedEnt   = ent;
+            c.name     = (plId > 0) ? ("Player #" + std::to_string(eid.id)) : ("NPC #" + std::to_string(eid.id));
+            c.hp       = GetTargetLiveHealth(eid.id, plId, ent);
+            c.pos      = p;
+            c.hasPos   = true;
+            c.isNpc    = (plId <= 0);
+            c.isDead   = false;
+            c.dist     = Vec3Dist(myPos, p);
+            out.push_back(std::move(c));
+        });
     }
 
     std::sort(out.begin(), out.end(), [](const NamedTargetCandidate& a, const NamedTargetCandidate& b) {
@@ -896,7 +1430,7 @@ inline std::vector<NamedTargetCandidate> CollectNearbyAuraTargets(float radiusM,
         if (c.elemId < 1 || (myElemId >= 1 && c.elemId == myElemId)) continue;
         if (!includeNpcs && c.isNpc) continue;
         if (!c.hasPos || c.dist > radiusM) continue;
-        if (c.hp <= 0 || c.isDead) continue;
+        if (c.isDead) continue;
         out.push_back(std::move(c));
     }
     g_kaLastNearbyCount.store(static_cast<int32_t>(out.size()), std::memory_order_relaxed);
@@ -904,7 +1438,6 @@ inline std::vector<NamedTargetCandidate> CollectNearbyAuraTargets(float radiusM,
 }
 
 inline bool LookupTargetPosition(int32_t elemId, int32_t playerId, int64_t pedEnt, Vec3& outPos) {
-    // 1. Real-time zero-lag view Transform or Morpeh Position on live ped entity
     if (pedEnt > 0) {
         int64_t view = Morpeh::GetViewEntity(pedEnt);
         if (view > 0) {
@@ -925,7 +1458,6 @@ inline bool LookupTargetPosition(int32_t elemId, int32_t playerId, int64_t pedEn
             }
         }
     }
-    // 2. Network displacement tracker (tracks even streamed/moving remote players)
     if (elemId >= 1) {
         std::lock_guard<std::mutex> lk(g_kaMutex);
         auto it = g_kaTracked.find(elemId);
@@ -935,7 +1467,6 @@ inline bool LookupTargetPosition(int32_t elemId, int32_t playerId, int64_t pedEn
             return true;
         }
     }
-    // 3. Cached ESP/server player lists
     {
         std::lock_guard<std::mutex> lk(g_espMutex);
         for (const auto& sp : g_allServerPlayers) {
@@ -964,8 +1495,6 @@ inline Vec3 ComputeMeleeStandPosition(const Vec3& myPos, const Vec3& targetPos, 
     return { targetPos.x - (dx / horiz) * standOffset, targetPos.y, targetPos.z - (dz / horiz) * standOffset };
 }
 
-// Native fallback: trigger ElementSendDisplacementSystem.SendPedDisplacement(localPed) while g_kaGhostOverridePos
-// is active and temporarily override local positionStash during the invoke so native packet builder encodes hopPos.
 inline bool InvokeNativeSendPedDisplacement(int64_t localPed, const Vec3* hopPosOverride = nullptr) {
     ResolveSystemsFromFeatureRunner();
     void* dispSys = g_kaElemSendDispSys.load(std::memory_order_acquire);
@@ -1020,6 +1549,17 @@ inline void SendGhostPedDisplacement(const Vec3& targetPos, bool isRestore) {
     pkt.vel_x = pkt.vel_y = pkt.vel_z = 0.0f;
     pkt.is_close_distance = 1;
 
+    // Face toward target cleanly in packet rotation
+    float faceDx = targetPos.x - realPos.x;
+    float faceDz = targetPos.z - realPos.z;
+    if (faceDx * faceDx + faceDz * faceDz > 0.01f) {
+        float yaw = std::atan2(faceDx, faceDz);
+        pkt.rot_x = 0.0f;
+        pkt.rot_y = std::sin(yaw * 0.5f);
+        pkt.rot_z = 0.0f;
+        pkt.rot_w = std::cos(yaw * 0.5f);
+    }
+
     double baseTime = g_kaLastRemoteTime > 0.0 ? g_kaLastRemoteTime : GetMonotonicSec();
     float chunk = std::max(2.0f, g_cfg.ghostStepChunkM);
     int64_t localPed = Morpeh::GetLocalPedEntity();
@@ -1030,6 +1570,7 @@ inline void SendGhostPedDisplacement(const Vec3& targetPos, bool isRestore) {
         pkt.pos_z = hopPos.z;
         pkt.remote_time = hopTime;
         g_kaGhostOverridePos = hopPos;
+        g_kaLastRemoteTime   = hopTime;
         g_kaGhostHoldUntilMs.store(GetMonotonicMs() + g_cfg.ghostHoldMs, std::memory_order_release);
         if (!SendDatagram(Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", &pkt, sizeof(pkt))) {
             InvokeNativeSendPedDisplacement(localPed, &hopPos);
@@ -1042,10 +1583,10 @@ inline void SendGhostPedDisplacement(const Vec3& targetPos, bool isRestore) {
         float rdy = realPos.y - g_kaLastGhostSentPos.y;
         float rdz = realPos.z - g_kaLastGhostSentPos.z;
         float backDist = std::sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-        int hops = std::clamp(static_cast<int>(std::ceil(backDist / chunk)), 1, 8);
+        int hops = std::clamp(static_cast<int>(std::ceil(backDist / chunk)), 1, g_cfg.maxGhostHopsPerStrike);
         for (int i = 1; i <= hops; ++i) {
             float t = static_cast<float>(i) / static_cast<float>(hops);
-            baseTime += 0.025;
+            baseTime += 0.022;
             emitHop({ g_kaLastGhostSentPos.x + rdx * t, g_kaLastGhostSentPos.y + rdy * t, g_kaLastGhostSentPos.z + rdz * t }, baseTime);
         }
         g_kaGhostHoldUntilMs.store(0, std::memory_order_release);
@@ -1066,7 +1607,7 @@ inline void SendGhostPedDisplacement(const Vec3& targetPos, bool isRestore) {
     int hops = std::clamp(static_cast<int>(std::ceil(segDist / chunk)), 1, g_cfg.maxGhostHopsPerStrike);
     for (int i = 1; i <= hops; ++i) {
         float t = static_cast<float>(i) / static_cast<float>(hops);
-        baseTime += 0.025;
+        baseTime += 0.022;
         emitHop({ anchorPos.x + dx * t, anchorPos.y + dy * t, anchorPos.z + dz * t }, baseTime);
     }
     g_kaLastRemoteTime   = baseTime;
@@ -1126,18 +1667,62 @@ inline void PerformStepReturnIfFinished(int64_t nowMs, bool forceReturn) {
     g_kaStepReturnAtMs = 0;
 }
 
+// Ensures both server (MeleeCombatModeStartDatagram) and local ECS (MeleeCombatMode + InMeleeBattle + MeleeCombo)
+// are in active Fist Combat Mode before strikes are sent.
+inline void EnsureLocalMeleeCombatMode(int64_t localPed, int64_t targetPed, uint64_t comboTs, int64_t nowMs) {
+    if (!g_kaCombatActive || (nowMs - g_kaCombatModeLastSentMs) >= 3500) {
+        SendDatagram(Offsets::g_cfg.nsMeleeDatagrams.c_str(), "MeleeCombatModeStartDatagram", nullptr, 0);
+        g_kaCombatActive         = true;
+        g_kaCombatModeLastSentMs = nowMs;
+    }
+    g_kaCombatFinishAtMs = nowMs + 1500;
+
+    if (localPed > 0 && SafeMem::IsPlausiblePtr(g_kaWeaponNotAllowedStash) &&
+        Morpeh::Has(g_kaWeaponNotAllowedStash, localPed)) {
+        Morpeh::Remove(g_kaWeaponNotAllowedStash, localPed);
+    }
+
+    int64_t localView  = (localPed > 0) ? Morpeh::GetViewEntity(localPed) : 0;
+    int64_t targetView = (targetPed > 0) ? Morpeh::GetViewEntity(targetPed) : 0;
+    if (localView <= 0) return;
+
+    if (SafeMem::IsPlausiblePtr(g_kaMeleeCombatModeStash) &&
+        !Morpeh::Has(g_kaMeleeCombatModeStash, localView)) {
+        uint8_t dummy = 1;
+        Morpeh::SetComponent(g_kaMeleeCombatModeStash, localView, &dummy, sizeof(dummy));
+    }
+
+    if (SafeMem::IsPlausiblePtr(g_kaInMeleeBattleStash)) {
+        InMeleeBattleComponent battle{};
+        battle.currentTarget = (targetView > 0) ? targetView : targetPed;
+        battle.battleTimer   = 5.0f;
+        Morpeh::SetComponent(g_kaInMeleeBattleStash, localView, &battle, sizeof(battle));
+    }
+
+    int32_t lvId = Morpeh::UnpackEntityId(localView);
+    if (lvId >= 0 && SafeMem::IsPlausiblePtr(g_kaMeleeComboStash) &&
+        Morpeh::Has(g_kaMeleeComboStash, localView)) {
+        // MeleeCombo.FirstHitTimeStamp is at 0x28 (dump1.4.1.cpp L426645)
+        if (void* comboPtr = Morpeh::Get(g_kaMeleeComboStash, lvId, 0x38)) {
+            SafeMem::Write(reinterpret_cast<uint8_t*>(comboPtr) + 0x28, &comboTs, sizeof(uint64_t));
+        }
+    }
+}
+
 inline void EndCombatModeIfNeeded(int64_t nowMs, bool forceNow) {
     if (!g_kaCombatActive) return;
     if (!forceNow && nowMs < g_kaCombatFinishAtMs) return;
     g_kaCombatActive = false;
+    g_kaCombatModeLastSentMs = 0;
     g_kaCombatFinishAtMs = 0;
     SendDatagram(Offsets::g_cfg.nsMeleeDatagrams.c_str(), "MeleeCombatFinishDatagram", nullptr, 0);
 }
 
-// Dispatches ONE clean fist strike against the resolved target using:
-// 1. Live captured WeaponProduceAttackMeleeSystem.SendAttackRequest(liveInstance, localPed, targetPed, ...)
-// 2. Post-call check & fallback to Stash<MeleeAttackRequestSend> (picked up by MeleeCombatAttackRequestSendSystem)
-// 3. Direct AOT MetaClientWrapper.Send<MeleeWeaponAttackRequestDatagram> (0x38 bytes) if ECS stashes unavailable
+// Dispatches ONE lethal fist strike against the resolved target:
+// - Enters MeleeCombatMode on server & client
+// - Standing phase: authentic 3-hit Light/Heavy/Ender combo (never invalid Finisher while standing!)
+// - Knockout phase: immediate kAtkFinisher ground finisher to turn KO into permanent kill (PedDead)
+// - Sends directly via AOT-safe FlakeFlow wire sender, with native ECS fallback if wire unavailable.
 inline bool StrikeTargetOnce(int32_t& ioElemId, int32_t& ioElemGen, int32_t targetPlayerId, int64_t hintPedEnt, int32_t strikeIdx) {
     if (!ResolveLocalElementId() || !Il2Cpp::Init()) return false;
     EnsureMeleeStashesResolved();
@@ -1148,8 +1733,7 @@ inline bool StrikeTargetOnce(int32_t& ioElemId, int32_t& ioElemGen, int32_t targ
 
     int64_t localPed  = Morpeh::GetLocalPedEntity();
     int64_t targetPed = ResolveTargetPedEntity(ioElemId, ioElemGen, targetPlayerId, hintPedEnt);
-    if (localPed <= 0) return false;
-    if (targetPed == localPed) return false;
+    if (localPed <= 0 || targetPed == localPed) return false;
 
     if (ioElemId < 1 && targetPed > 0) {
         ReadPedElementId(targetPed, ioElemId, ioElemGen);
@@ -1162,80 +1746,76 @@ inline bool StrikeTargetOnce(int32_t& ioElemId, int32_t& ioElemGen, int32_t targ
     float realDist = Vec3Dist(myPos, tPos);
     if (realDist > g_cfgState.killAroundRadius) return false;
 
-    Vec3 effMyPos = (g_kaHasActiveGhost && realDist > g_cfg.directMeleeRangeM && IsFiniteVec3(g_kaLastGhostSentPos))
+    int64_t nowMs = GetMonotonicMs();
+    if (g_kaActiveSeq.comboTimestamp == 0 || (strikeIdx % 3) == 0) {
+        g_kaActiveSeq.comboTimestamp = GetValidServerTimestamp();
+    }
+    uint64_t comboTs = g_kaActiveSeq.comboTimestamp;
+
+    EnsureLocalMeleeCombatMode(localPed, targetPed, comboTs, nowMs);
+
+    Vec3 effMyPos = (g_kaHasActiveGhost && IsFiniteVec3(g_kaLastGhostSentPos))
                         ? g_kaLastGhostSentPos
                         : myPos;
-    Vec3 hitPosUnity = { tPos.x, tPos.y + 0.95f, tPos.z };
-    Vec3 delta       = { tPos.x - effMyPos.x, (tPos.y + 0.95f) - (effMyPos.y + 0.95f), tPos.z - effMyPos.z };
+    Vec3 hitPosUnity = { tPos.x, tPos.y + 0.90f, tPos.z };
+    Vec3 delta       = { tPos.x - effMyPos.x, (tPos.y + 0.90f) - (effMyPos.y + 0.90f), tPos.z - effMyPos.z };
     float dLenSq     = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
     Vec3 dirUnity    = (dLenSq > 1e-5f) ? Vec3Norm(delta) : Vec3{ 0.0f, 0.0f, 1.0f };
 
-    // Choose smart attack type: immediately Finisher if knocked out, else cycle Heavy(KO) -> Finisher(KO) -> Light(KO)
-    bool koState     = IsTargetInKnockout(targetPed);
-    bool isKnockout  = koState || g_cfgState.bKillAroundOneHit || ((strikeIdx % 3) != 2);
-    int32_t meleeDir = MeleeEnum::kDirFront;
-    int32_t heightTy = MeleeEnum::kHeightMiddle;
-    int32_t attackTy = MeleeEnum::kAtkHeavy;
-    if (koState || (strikeIdx % 3) == 1) {
-        attackTy = MeleeEnum::kAtkFinisher;
-        heightTy = koState ? MeleeEnum::kHeightLow : MeleeEnum::kHeightMiddle;
-    } else if ((strikeIdx % 3) == 0) {
-        attackTy = MeleeEnum::kAtkHeavy;
-        heightTy = MeleeEnum::kHeightHigh;
+    int32_t liveHp = GetTargetLiveHealth(ioElemId, targetPlayerId, targetPed);
+    g_kaSeqUiHp.store(liveHp, std::memory_order_relaxed);
+    bool koState = IsTargetInKnockout(targetPed) || (liveHp <= 0);
+
+    int32_t meleeDir   = MeleeEnum::kDirFront;
+    int32_t heightTy   = MeleeEnum::kHeightMiddle;
+    int32_t attackTy   = MeleeEnum::kAtkHeavy;
+    bool    isKnockout = false;
+
+    if (koState) {
+        if (g_kaActiveSeq.koEnteredMs == 0) {
+            g_kaActiveSeq.koEnteredMs = nowMs;
+            g_kaActiveSeq.comboTimestamp = GetValidServerTimestamp();
+            comboTs = g_kaActiveSeq.comboTimestamp;
+        }
+        int32_t koIdx = g_kaActiveSeq.koStrikesSent++;
+        // Primary ground execution: kAtkFinisher; every 4th KO strike mix Heavy low as fallback
+        if ((koIdx % 4) == 3) {
+            attackTy = MeleeEnum::kAtkHeavy;
+            heightTy = MeleeEnum::kHeightLow;
+            meleeDir = MeleeEnum::kDirFront;
+        } else {
+            attackTy = MeleeEnum::kAtkFinisher;
+            heightTy = MeleeEnum::kHeightLow;
+            meleeDir = MeleeEnum::kDirFront;
+        }
+        isKnockout = true;
     } else {
-        attackTy = MeleeEnum::kAtkLight;
-        heightTy = MeleeEnum::kHeightMiddle;
+        // Authentic 3-hit standing combo: Light -> Heavy -> Heavy(ComboEnder + KO)
+        int32_t step = strikeIdx % 3;
+        if (step == 0) {
+            attackTy   = MeleeEnum::kAtkLight;
+            heightTy   = MeleeEnum::kHeightHigh;
+            meleeDir   = MeleeEnum::kDirLeft;
+            isKnockout = false;
+        } else if (step == 1) {
+            attackTy   = MeleeEnum::kAtkHeavy;
+            heightTy   = MeleeEnum::kHeightMiddle;
+            meleeDir   = MeleeEnum::kDirRight;
+            isKnockout = g_cfgState.bKillAroundOneHit && (liveHp <= 45 || strikeIdx >= 3);
+        } else {
+            attackTy   = MeleeEnum::kAtkHeavy;
+            heightTy   = MeleeEnum::kHeightHigh;
+            meleeDir   = MeleeEnum::kDirFront;
+            isKnockout = true;
+        }
     }
 
-    int64_t nowMs = GetMonotonicMs();
     if (ioElemId >= 1) g_kaRecentHits[(g_kaRecentWriteIdx++) & 31] = { ioElemId, nowMs };
 
     bool dispatched = false;
-    bool hadPendingBefore = SafeMem::IsPlausiblePtr(g_kaMeleeReqSendStash) && Morpeh::Has(g_kaMeleeReqSendStash, localPed);
-    bool ecsUnconfirmed = (strikeIdx >= 1 && g_kaSrvAcceptedCount == g_kaTargetStartSrvAcc);
-    void* meleeSys = g_kaWeaponProduceMeleeSys.load(std::memory_order_acquire);
 
-    // Path 1: Native WeaponProduceAttackMeleeSystem.SendAttackRequest with live `this` instance + valid `targetPed`
-    if (!hadPendingBefore && SafeMem::IsPlausiblePtr(meleeSys) && targetPed > 0) {
-        if (!g_kaSendAttackRequestMI) {
-            g_kaSendAttackRequestMI = Il2Cpp::ResolveMethod(
-                Offsets::g_cfg.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "SendAttackRequest", 8);
-        }
-        if (SafeMem::IsPlausiblePtr(g_kaSendAttackRequestMI)) {
-            void* params[8] = {
-                &localPed, &targetPed, &hitPosUnity, &dirUnity,
-                &meleeDir, &heightTy, &attackTy, &isKnockout
-            };
-            void* exc = nullptr;
-            Il2Cpp::SafeInvoke(g_kaSendAttackRequestMI, meleeSys, params, &exc);
-            if (!exc && SafeMem::IsPlausiblePtr(g_kaMeleeReqSendStash)) {
-                dispatched = Morpeh::Has(g_kaMeleeReqSendStash, localPed);
-            }
-        }
-    }
-
-    // Path 2: Stage MeleeAttackRequestSend directly into Morpeh (drained by MeleeCombatAttackRequestSendSystem.OnUpdate)
-    if (!dispatched && !hadPendingBefore && SafeMem::IsPlausiblePtr(g_kaMeleeReqSendStash) && targetPed > 0) {
-        MeleeAttackRequestSendComponent comp{};
-        comp.target           = targetPed;
-        comp.attackHeightType = heightTy;
-        comp.attackDirection  = meleeDir;
-        comp.attackType       = attackTy;
-        comp.dir_x            = dirUnity.x;
-        comp.dir_y            = dirUnity.y;
-        comp.dir_z            = dirUnity.z;
-        comp.hit_x            = hitPosUnity.x;
-        comp.hit_y            = hitPosUnity.y;
-        comp.hit_z            = hitPosUnity.z;
-        comp.isKnockout       = isKnockout ? 1 : 0;
-        if (Morpeh::SetComponent(g_kaMeleeReqSendStash, localPed, &comp, sizeof(comp))) {
-            dispatched = true;
-        }
-    }
-
-    // Path 3: Direct wire datagram fallback (exact 0x38 bytes + server-synced DateTime)
-    // Fires if ECS paths did not stage, or if previous staged component wasn't drained / server didn't echo yet.
-    if ((!dispatched || hadPendingBefore || ecsUnconfirmed) && ioElemId >= 1) {
+    // Tier 1 (Primary Guaranteed Path): Non-generic AOT-safe FlakeFlow wire send (0x38 bytes)
+    if (ioElemId >= 1) {
         MeleeWeaponAttackRequestDatagram dg{};
         dg.attacker_id  = myId;
         dg.attacker_gen = myGen;
@@ -1248,18 +1828,56 @@ inline bool StrikeTargetOnce(int32_t& ioElemId, int32_t& ioElemGen, int32_t targ
         dg.trace_y      = dirUnity.y;
         dg.trace_z      = dirUnity.z;
         dg.is_ko        = isKnockout ? 1 : 0;
-        dg.timestamp    = GetValidServerTimestamp();
+        dg.timestamp    = comboTs;
+
         g_kaMeleeOursFlag.fetch_add(1, std::memory_order_acq_rel);
         bool sent = SendDatagram(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram", &dg, sizeof(dg));
         g_kaMeleeOursFlag.fetch_sub(1, std::memory_order_acq_rel);
         if (sent) dispatched = true;
     }
 
+    // Tier 2 (ECS Fallback if wire sender not yet warmed up): WeaponProduceAttackMeleeSystem.SendAttackRequest + Stash
+    if (!dispatched && targetPed > 0) {
+        void* meleeSys = g_kaWeaponProduceMeleeSys.load(std::memory_order_acquire);
+        if (SafeMem::IsPlausiblePtr(meleeSys)) {
+            if (!g_kaSendAttackRequestMI) {
+                g_kaSendAttackRequestMI = Il2Cpp::ResolveMethod(
+                    Offsets::g_cfg.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "SendAttackRequest", 8);
+            }
+            if (SafeMem::IsPlausiblePtr(g_kaSendAttackRequestMI)) {
+                void* params[8] = {
+                    &localPed, &targetPed, &hitPosUnity, &dirUnity,
+                    &meleeDir, &heightTy, &attackTy, &isKnockout
+                };
+                void* exc = nullptr;
+                Il2Cpp::SafeInvoke(g_kaSendAttackRequestMI, meleeSys, params, &exc);
+                if (!exc && SafeMem::IsPlausiblePtr(g_kaMeleeReqSendStash)) {
+                    dispatched = Morpeh::Has(g_kaMeleeReqSendStash, localPed);
+                }
+            }
+        }
+        if (!dispatched && SafeMem::IsPlausiblePtr(g_kaMeleeReqSendStash)) {
+            MeleeAttackRequestSendComponent comp{};
+            comp.target           = targetPed;
+            comp.attackHeightType = heightTy;
+            comp.attackDirection  = meleeDir;
+            comp.attackType       = attackTy;
+            comp.dir_x            = dirUnity.x;
+            comp.dir_y            = dirUnity.y;
+            comp.dir_z            = dirUnity.z;
+            comp.hit_x            = hitPosUnity.x;
+            comp.hit_y            = hitPosUnity.y;
+            comp.hit_z            = hitPosUnity.z;
+            comp.isKnockout       = isKnockout ? 1 : 0;
+            if (Morpeh::SetComponent(g_kaMeleeReqSendStash, localPed, &comp, sizeof(comp))) {
+                dispatched = true;
+            }
+        }
+    }
+
     if (dispatched) {
         g_kaLastSendError.store(0, std::memory_order_relaxed);
-        g_kaCombatActive     = true;
-        g_kaCombatFinishAtMs = nowMs + 600;
-        g_kaTargetSentHits  += 1;
+        g_kaTargetSentHits += 1;
     }
     return dispatched;
 }
@@ -1270,8 +1888,6 @@ inline int KillSingleTargetBurst(int32_t targetElemId, int32_t targetGen, int32_
     return StrikeTargetOnce(eId, eGen, targetPlayerId, 0, g_kaTargetSentHits) ? 1 : 0;
 }
 
-// Ensures attacker server/client position is within directMeleeRangeM of `targetPos`.
-// Returns true if a new jump/displacement step occurred from >directMeleeRangeM.
 inline bool EngageRangeForTargetIfNeeded(int32_t elemId, int32_t playerId, int64_t pedEnt, int64_t nowMs, bool* outJumpedFromFar = nullptr) {
     if (outJumpedFromFar) *outJumpedFromFar = false;
     Vec3 myPos{}, tPos{};
@@ -1281,7 +1897,7 @@ inline bool EngageRangeForTargetIfNeeded(int32_t elemId, int32_t playerId, int64
     g_kaCurrentTargetDist = realDist;
     if (realDist > g_cfgState.killAroundRadius) return false;
 
-    // Close range: no displacement assist needed
+    // Point-blank range (<= 1.90m) with no active ghost: strike directly with zero displacement
     if (realDist <= g_cfg.directMeleeRangeM && !g_kaHasActiveGhost && !g_kaStepActive) {
         return false;
     }
@@ -1292,8 +1908,7 @@ inline bool EngageRangeForTargetIfNeeded(int32_t elemId, int32_t playerId, int64
 
     bool activeAssist = false;
     if (g_cfgState.bKillAroundMicroStep) {
-        float effDist = Vec3Dist(myPos, tPos);
-        if (effDist > (g_cfg.directMeleeRangeM * 0.85f)) {
+        if (realDist > g_cfg.directMeleeRangeM) {
             PerformPhysicalStepTo(tPos, nowMs);
             if (outJumpedFromFar) *outJumpedFromFar = true;
         }
@@ -1302,16 +1917,17 @@ inline bool EngageRangeForTargetIfNeeded(int32_t elemId, int32_t playerId, int64
     if (g_cfgState.bKillAroundGhostStep) {
         Vec3 anchor = g_kaHasActiveGhost ? g_kaLastGhostSentPos : myPos;
         float anchorDist = Vec3Dist(anchor, tPos);
-        if (!g_kaHasActiveGhost || anchorDist > (g_cfg.directMeleeRangeM * 0.78f)) {
+        if (!g_kaHasActiveGhost || anchorDist > 1.75f || std::fabs(anchor.y - tPos.y) > 1.1f) {
             bool wasGhost = g_kaHasActiveGhost;
             float preJumpDist = anchorDist;
             SendGhostPedDisplacement(tPos, false);
-            if (outJumpedFromFar && (!wasGhost || preJumpDist > g_cfg.directMeleeRangeM)) {
+            if (outJumpedFromFar && (!wasGhost || preJumpDist > 2.2f)) {
                 *outJumpedFromFar = true;
             }
         } else {
-            // Keep ghost override alive while swinging sequentially
-            g_kaGhostOverridePos = ComputeMeleeStandPosition(anchor, tPos, g_cfg.ghostHitOffsetM);
+            Vec3 standPos = ComputeMeleeStandPosition(anchor, tPos, g_cfg.ghostHitOffsetM);
+            g_kaGhostOverridePos = standPos;
+            g_kaLastGhostSentPos = standPos;
             g_kaGhostHoldUntilMs.store(nowMs + g_cfg.ghostHoldMs, std::memory_order_release);
         }
         activeAssist = true;
@@ -1360,7 +1976,6 @@ inline void StopAll() {
     g_kaPendingRestoreGhost.store(true, std::memory_order_release);
 }
 
-// Normalizes datagram pointer whether IL2CPP invoked it unboxed (`T*`) or boxed (`Il2CppObject*`).
 inline const void* NormalizeDatagramPtr(const void* rawPkt, void*& cachedKlass, const char* ns, const char* cls) {
     if (!SafeMem::IsPlausiblePtr(rawPkt)) return nullptr;
     if (!cachedKlass && Il2Cpp::Init()) cachedKlass = Il2Cpp::FindClass(ns, cls);
@@ -1392,24 +2007,31 @@ inline void OnPedDisplacementRead(const void* rawPkt) {
     te.isPed = true;
 }
 
-inline void OnPedDisplacementWrite(void* rawPkt) {
+inline void OnPedDisplacementWrite(void* rawPkt, void* writer = nullptr) {
+    if (writer) ObserveLiveWriterHeader(writer, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+    if (g_kaSendingOwnDgram.load(std::memory_order_acquire) > 0) return;
+
     void* ptr = NormalizeDatagramPtrMut(rawPkt, g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     PedDisplacementSyncDatagramPacket inPkt{};
     if (!SafeMem::ReadVal(ptr, inPkt)) return;
     if (inPkt.remote_id >= 1 && inPkt.remote_id < 2000000) {
-        CopyRawBytes(g_kaPedDispTemplate, &inPkt, sizeof(g_kaPedDispTemplate));
-        g_kaHasPedDispTemplate.store(true, std::memory_order_release);
+        if (!g_kaHasActiveGhost) {
+            CopyRawBytes(g_kaPedDispTemplate, &inPkt, sizeof(g_kaPedDispTemplate));
+            g_kaHasPedDispTemplate.store(true, std::memory_order_release);
+        }
         if (std::isfinite(inPkt.remote_time) && inPkt.remote_time > g_kaLastRemoteTime) {
             g_kaLastRemoteTime = inPkt.remote_time;
         }
     }
     if (g_cfgState.bKillAroundGhostStep && g_kaGhostHoldUntilMs.load(std::memory_order_acquire) > GetMonotonicMs() &&
         (std::fabs(g_kaGhostOverridePos.x) > 0.1f || std::fabs(g_kaGhostOverridePos.z) > 0.1f)) {
+        g_kaLastRemoteTime += 0.020;
         inPkt.pos_x = g_kaGhostOverridePos.x;
         inPkt.pos_y = g_kaGhostOverridePos.y;
         inPkt.pos_z = g_kaGhostOverridePos.z;
         inPkt.vel_x = inPkt.vel_y = inPkt.vel_z = 0.0f;
+        inPkt.remote_time = g_kaLastRemoteTime;
         inPkt.is_close_distance = 1;
         SafeMem::Write(ptr, &inPkt, sizeof(inPkt));
     }
@@ -1435,9 +2057,20 @@ inline void OnMeleeAttackRead(const void* rawPkt) {
     g_kaHasMeleeTemplate.store(true, std::memory_order_release);
     int32_t myId = g_kaLocalElemId.load(std::memory_order_relaxed);
     if (myId >= 1 && pkt.attacker_id == myId) ++g_kaSrvAcceptedCount;
+    if (pkt.target_id >= 1 && pkt.target_id < 2000000 && pkt.damage > 0) {
+        std::lock_guard<std::mutex> lk(g_kaMutex);
+        TrackedElement& te = g_kaTracked[pkt.target_id];
+        te.id = pkt.target_id;
+        te.hp = std::max(0, te.hp - pkt.damage);
+        te.lastSeenMs = GetMonotonicMs();
+        te.isPed = true;
+    }
 }
 
-inline void OnMeleeRequestWrite(void* rawPkt) {
+inline void OnMeleeRequestWrite(void* rawPkt, void* writer = nullptr) {
+    if (writer) ObserveLiveWriterHeader(writer, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+    if (g_kaSendingOwnDgram.load(std::memory_order_acquire) > 0) return;
+
     void* ptr = NormalizeDatagramPtrMut(rawPkt, g_kaClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     MeleeWeaponAttackRequestDatagram req{};
@@ -1453,7 +2086,6 @@ inline void OnMeleeRequestWrite(void* rawPkt) {
          g_kaActiveSeq.active || g_kaCurrentTargetId > 0 ||
          GetMonotonicMs() < g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed))) {
         uint8_t ko = 1;
-        // Write ONLY the 1-byte IsKnockout field at 0x28 (never overwrite past the 0x38 struct)
         SafeMem::Write(reinterpret_cast<uint8_t*>(ptr) + 0x28, &ko, sizeof(ko));
     }
 }
@@ -1479,7 +2111,7 @@ inline void StartKillAllWaveOnMainThread(int64_t nowMs) {
     g_kaKillAllSeqMs.store(nowMs, std::memory_order_release);
     g_kaKillAllSeqTotal.store(static_cast<int32_t>(g_kaWaveQueue.size()), std::memory_order_release);
     if (!g_kaWaveQueue.empty()) {
-        int64_t maxDur = std::max<int64_t>(g_cfg.killAllBurstMs, static_cast<int64_t>(g_kaWaveQueue.size()) * 1800LL + 1500LL);
+        int64_t maxDur = std::max<int64_t>(g_cfg.killAllBurstMs, static_cast<int64_t>(g_kaWaveQueue.size()) * 5200LL + 2000LL);
         g_kaKillAllBurstUntilMs.store(nowMs + maxDur, std::memory_order_release);
     } else {
         g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
@@ -1489,21 +2121,28 @@ inline void StartKillAllWaveOnMainThread(int64_t nowMs) {
 
 inline void BeginSequentialTarget(const NamedTargetCandidate& c, int64_t nowMs) {
     g_kaActiveSeq = SequentialActiveTarget{};
-    g_kaActiveSeq.active       = true;
-    g_kaActiveSeq.playerId     = c.playerId;
-    g_kaActiveSeq.elemId       = c.elemId;
-    g_kaActiveSeq.elemGen      = (c.elemGen > 0) ? c.elemGen : 1;
-    g_kaActiveSeq.pedEnt       = ResolveTargetPedEntity(c.elemId, g_kaActiveSeq.elemGen, c.playerId, c.pedEnt);
-    g_kaActiveSeq.name         = c.name;
-    g_kaActiveSeq.startedMs    = nowMs;
-    g_kaActiveSeq.lastStrikeMs = 0;
-    g_kaActiveSeq.strikesSent  = 0;
+    g_kaActiveSeq.active         = true;
+    g_kaActiveSeq.playerId       = c.playerId;
+    g_kaActiveSeq.elemId         = c.elemId;
+    g_kaActiveSeq.elemGen        = (c.elemGen > 0) ? c.elemGen : 1;
+    g_kaActiveSeq.pedEnt         = ResolveTargetPedEntity(c.elemId, g_kaActiveSeq.elemGen, c.playerId, c.pedEnt);
+    g_kaActiveSeq.name           = c.name;
+    g_kaActiveSeq.startedMs      = nowMs;
+    g_kaActiveSeq.lastStrikeMs   = 0;
+    g_kaActiveSeq.koEnteredMs    = 0;
+    g_kaActiveSeq.comboTimestamp = GetValidServerTimestamp();
+    g_kaActiveSeq.strikesSent    = 0;
+    g_kaActiveSeq.koStrikesSent  = 0;
 
-    g_kaCurrentTargetId        = c.elemId;
-    g_kaCurrentTargetGen       = g_kaActiveSeq.elemGen;
-    g_kaSelectedName           = c.name;
-    g_kaTargetSentHits         = 0;
-    g_kaTargetStartSrvAcc      = g_kaSrvAcceptedCount;
+    g_kaCurrentTargetId          = c.elemId;
+    g_kaCurrentTargetGen         = g_kaActiveSeq.elemGen;
+    g_kaSelectedName             = c.name;
+    g_kaTargetSentHits           = 0;
+    g_kaTargetStartSrvAcc        = g_kaSrvAcceptedCount;
+    g_kaSeqUiHp.store(GetTargetLiveHealth(c.elemId, c.playerId, g_kaActiveSeq.pedEnt), std::memory_order_relaxed);
+
+    // Pre-enter fist combat mode immediately so server is ready before Strike #0 arrives
+    EnsureLocalMeleeCombatMode(Morpeh::GetLocalPedEntity(), g_kaActiveSeq.pedEnt, g_kaActiveSeq.comboTimestamp, nowMs);
 
     bool jumped = false;
     bool assist = EngageRangeForTargetIfNeeded(g_kaActiveSeq.elemId, g_kaActiveSeq.playerId, g_kaActiveSeq.pedEnt, nowMs, &jumped);
@@ -1584,14 +2223,12 @@ inline void Tick() {
         return;
     }
 
-    // Periodic UI nearby count refresh while menu subtab is open
     static int64_t s_lastUiNearMs = 0;
-    if (kaTabVisible && !killAllWave && !auraOn && (nowMs - s_lastUiNearMs) >= 650) {
+    if (kaTabVisible && !killAllWave && !auraOn && (nowMs - s_lastUiNearMs) >= 500) {
         s_lastUiNearMs = nowMs;
         CollectNearbyAuraTargets(g_cfgState.killAroundRadius, g_cfgState.bKillAroundIncludeNpcs);
     }
 
-    // Cleanup timed-out Kill-All wave if burst timer expired mid-wave
     if (!killAllWave && (!g_kaWaveQueue.empty() || g_kaKillAllSeqTotal.load(std::memory_order_relaxed) > 0)) {
         g_kaWaveQueue.clear();
         g_kaKillAllSeqTotal.store(0, std::memory_order_release);
@@ -1605,11 +2242,14 @@ inline void Tick() {
     if (seqModeActive) {
         // 1. Validate / advance active sequential target
         if (g_kaActiveSeq.active) {
+            if (g_kaActiveSeq.pedEnt <= 0) {
+                g_kaActiveSeq.pedEnt = ResolveTargetPedEntity(g_kaActiveSeq.elemId, g_kaActiveSeq.elemGen, g_kaActiveSeq.playerId, 0);
+            }
             bool dead = IsTargetConfirmedDead(g_kaActiveSeq.elemId, g_kaActiveSeq.playerId, g_kaActiveSeq.pedEnt);
             Vec3 myPos{}, tPos{};
             bool hasLivePos = GetLocalPlayerPos(myPos) &&
                               LookupTargetPosition(g_kaActiveSeq.elemId, g_kaActiveSeq.playerId, g_kaActiveSeq.pedEnt, tPos);
-            bool outOfRange = !hasLivePos || (Vec3Dist(myPos, tPos) > (g_cfgState.killAroundRadius + 2.5f));
+            bool outOfRange = !hasLivePos || (Vec3Dist(myPos, tPos) > (g_cfgState.killAroundRadius + 3.0f));
             bool expired    = (g_kaActiveSeq.strikesSent >= g_cfg.maxStrikesPerTarget) ||
                               ((nowMs - g_kaActiveSeq.startedMs) >= g_cfg.maxMsPerTarget);
 
@@ -1629,7 +2269,7 @@ inline void Tick() {
             }
         }
 
-        // 2. Pick NEXT single target sequentially (only when previous target finished/died)
+        // 2. Pick NEXT single target sequentially (only after previous target died or expired)
         if (!g_kaActiveSeq.active) {
             if (killAllWave) {
                 int32_t idx = g_kaKillAllSeqIdx.load(std::memory_order_acquire);
@@ -1665,7 +2305,7 @@ inline void Tick() {
                 }
             } else if (auraOn) {
                 static int64_t s_lastAuraScanMs = 0;
-                if ((nowMs - s_lastAuraScanMs) >= 90) {
+                if ((nowMs - s_lastAuraScanMs) >= 85) {
                     s_lastAuraScanMs = nowMs;
                     auto nearList = CollectNearbyAuraTargets(g_cfgState.killAroundRadius, g_cfgState.bKillAroundIncludeNpcs);
                     for (auto& cand : nearList) {
@@ -1682,14 +2322,16 @@ inline void Tick() {
             }
         }
 
-        // 3. Keep range assist & dispatch ONE strike at a time on active target
+        // 3. Maintain range lock & dispatch sequential strikes on the active target
         if (g_kaActiveSeq.active) {
             bool jumped = false;
             EngageRangeForTargetIfNeeded(g_kaActiveSeq.elemId, g_kaActiveSeq.playerId, g_kaActiveSeq.pedEnt, nowMs, &jumped);
             if (jumped && g_kaActiveSeq.strikesSent == 0) {
                 g_kaActiveSeq.readyToStrikeAtMs = std::max(g_kaActiveSeq.readyToStrikeAtMs, nowMs + g_cfg.ghostSettleLeadMs);
             }
-            int32_t interval = singleFollow && !killAllWave && !auraOn ? g_cfg.singleFollowIntervalMs : g_cfg.strikeIntervalMs;
+            bool inKo = IsTargetInKnockout(g_kaActiveSeq.pedEnt);
+            int32_t interval = inKo ? g_cfg.koStrikeIntervalMs
+                                    : (singleFollow && !killAllWave && !auraOn ? g_cfg.singleFollowIntervalMs : g_cfg.strikeIntervalMs);
             if (nowMs >= g_kaActiveSeq.readyToStrikeAtMs &&
                 (g_kaActiveSeq.lastStrikeMs == 0 || (nowMs - g_kaActiveSeq.lastStrikeMs) >= interval)) {
                 g_kaActiveSeq.lastStrikeMs = nowMs;
@@ -1727,25 +2369,26 @@ inline void DrawPanel(float availW) {
 
     ImGui::TextColored(
         (myId > 0 && hasMcw && err == 0) ? ImVec4(0.28f, 0.98f, 0.65f, 1.0f) : ImVec4(1.0f, 0.72f, 0.28f, 1.0f),
-        "Elem=%d/%d | Net=%s | MeleeSys=%s | Near=%d | SrvHits=%d | E=%d",
-        myId, myGen, hasMcw ? "OK" : "Wait", hasSys ? "OK" : "Fallback", nearN, g_kaSrvAcceptedCount, err);
+        "Elem=%d/%d | Net=%s | Melee=%s | Near=%d | SrvHits=%d | E=%d",
+        myId, myGen, hasMcw ? "AOT-OK" : "Wait", hasSys ? "OK" : "Wire", nearN, g_kaSrvAcceptedCount, err);
 
     if (g_kaSeqUiActive.load(std::memory_order_acquire)) {
         int32_t tot = g_kaKillAllSeqTotal.load(std::memory_order_relaxed);
         int32_t cur = g_kaKillAllSeqIdx.load(std::memory_order_relaxed);
         int32_t eid = g_kaSeqUiElemId.load(std::memory_order_relaxed);
         int32_t stk = g_kaSeqUiStrikes.load(std::memory_order_relaxed);
+        int32_t hp  = g_kaSeqUiHp.load(std::memory_order_relaxed);
         std::string tName;
         {
             std::lock_guard<std::mutex> lk(g_kaUiNameMutex);
             tName = g_kaUiTargetName;
         }
         ImGui::TextColored(ImVec4(0.98f, 0.45f, 0.45f, 1.0f),
-                           "%s: %s (%d/%d) | Strikes=%d | Dist=%.1fm",
+                           "%s: %s (%d/%d) | HP=%d | Hits=%d | %.1fm",
                            T("Target", "الهدف"),
                            !tName.empty() ? tName.c_str() : ("#" + std::to_string(eid)).c_str(),
                            tot > 0 ? cur : 1, tot > 0 ? tot : 1,
-                           stk, g_kaCurrentTargetDist);
+                           hp, stk, g_kaCurrentTargetDist);
     }
 
     char killAllBtn[160];
