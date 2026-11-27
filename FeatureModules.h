@@ -315,7 +315,6 @@ inline void SetHwbpOnThread(thread_t thr, bool wantCombat, bool wantMap, bool wa
         }
     }
     if (thread_set_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS && activeSlots > 2) {
-        // Fallback to 2 slots if hardware implements only 2 HW breakpoints
         if (wantCombat) {
             PopulateDebugBreakpoints(dbg, true, false, false);
         } else {
@@ -576,11 +575,11 @@ inline void Tick() {
     if (!Morpeh::g_stashes.worldReady) return;
     ResolveLayerMasksOnce();
 
-    const int64_t kaNowMs = KillAround::GetMonotonicMs();
+    const int64_t kaNowMs = KillAround::MonoMs();
     const bool kaActive = (g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-                           KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > kaNowMs);
+                           KillAround::g_BurstUntilMs.load(std::memory_order_relaxed) > kaNowMs);
     const bool wantPoll  = !Il2Cpp::IsUnityObjectSafe(KillAround::g_metaClient.load(std::memory_order_acquire));
-    const bool wantDisp  = (KillAround::g_LastRemoteTime.load(std::memory_order_acquire) <= 1000.0) || kaActive;
+    const bool wantDisp  = (KillAround::g_IncomingRemoteMs.load(std::memory_order_acquire) == 0) || kaActive;
     const bool wantMelee = kaActive && g_cfgState.bKillAroundOneHit;
 
     g_kaWantPoll.store(wantPoll, std::memory_order_release);
@@ -602,7 +601,6 @@ inline void Tick() {
 
             bool prevCombat = g_combatArmed.exchange(wantCombat && haveCombatEntry, std::memory_order_acq_rel);
             bool prevKa     = g_kaArmed.exchange(wantKa && haveKaEntry, std::memory_order_acq_rel);
-            bool prevPoll   = wantPoll;
             static bool s_prevPoll = false, s_prevDisp = false, s_prevMelee = false;
             g_mapArmed.store(false, std::memory_order_release);
             g_armed.store(true, std::memory_order_release);
@@ -613,7 +611,6 @@ inline void Tick() {
             s_prevPoll  = wantPoll;
             s_prevDisp  = wantDisp;
             s_prevMelee = wantMelee;
-            (void)prevPoll;
 
             static double s_lastReapply = 0.0;
             double now = CACurrentMediaTime();
@@ -1126,33 +1123,33 @@ static void Hook_SkipLoseConscUpdate(void* self, float dt, void* method) {
     if (orig_SkipLoseConscUpdate) orig_SkipLoseConscUpdate(self, dt, method);
 }
 
-// KillAround Datagram, Client & Melee Hooks (exact kill_around (2).h + mainTOW.cpp hook set)
+// KillAround v3 (kill_around (3).h) Datagram, Client & Melee Hooks
 static void Hook_PedDispRead(void* self, void* reader, void* method) {
-    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_ClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
     void* ptr = unboxed ? unboxed : self;
     if (orig_PedDispRead) orig_PedDispRead(ptr, reader, method);
     KillAround::OnPedDisplacementRead(ptr);
 }
 static void Hook_PedDeadRead(void* self, void* reader, void* method) {
-    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_ClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
     void* ptr = unboxed ? unboxed : self;
     if (orig_PedDeadRead) orig_PedDeadRead(ptr, reader, method);
     KillAround::OnPedDeadRead(ptr);
 }
 static void Hook_MeleeAtkRead(void* self, void* reader, void* method) {
-    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_ClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
     void* ptr = unboxed ? unboxed : self;
     if (orig_MeleeAtkRead) orig_MeleeAtkRead(ptr, reader, method);
     KillAround::OnMeleeAttackRead(ptr);
 }
 static void Hook_MeleeAtkWrite(void* self, void* writer, void* method) {
-    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_ClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
     void* ptr = unboxed ? unboxed : self;
     KillAround::OnMeleeAttackWrite(ptr, writer);
     if (orig_MeleeAtkWrite) orig_MeleeAtkWrite(ptr, writer, method);
 }
 static void Hook_MeleeReqWrite(void* self, void* writer, void* method) {
-    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_ClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
     void* ptr = unboxed ? unboxed : self;
     KillAround::OnMeleeRequestWrite(ptr, writer);
     if (orig_MeleeReqWrite) orig_MeleeReqWrite(ptr, writer, method);
@@ -4022,9 +4019,9 @@ inline void RefreshWorldSnapshot(float dt) {
             localClanId = Il2Cpp::ReadManagedString(SafeMem::PtrAt(cp, 0));
     }
 
-    // Populate ESP / Aimbot / Spectate / KillAround / Player-List Snapshot
+    // Populate ESP / Aimbot / Spectate / KillAround v3 / Player-List Snapshot
     bool killAroundActive = g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-                            (KillAround::GetMonotonicMs() < KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed)) ||
+                            (KillAround::MonoMs() < KillAround::g_BurstUntilMs.load(std::memory_order_relaxed)) ||
                             (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
                              g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
                              g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3);
@@ -4380,7 +4377,7 @@ inline void RefreshWorldSnapshot(float dt) {
     // Gated Server-Wide All Players scan (~2Hz) — runs when FreeCam, Live Players, or Kill Around is open/active!
     if ((menuOpen && ((uiTab == 1 && uiSub == 1) || (uiTab == 3 && uiSub == 2) || (uiTab == 0 && uiSub == 3))) ||
         g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-        KillAround::GetMonotonicMs() < KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed)) {
+        KillAround::MonoMs() < KillAround::g_BurstUntilMs.load(std::memory_order_relaxed)) {
         static double s_lastServerPlScan = 0.0;
         if (now - s_lastServerPlScan >= 0.45) {
             s_lastServerPlScan = now;

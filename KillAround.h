@@ -1,4 +1,19 @@
 #pragma once
+// ============================================================================
+// KillAround.h — Direct iOS arm64 port of kill_around (3).h
+//   - Byte-identical datagram structs & combat protocol from kill_around (3).h:
+//       * SendModeStart -> optional SendOneHitRaw -> 6x SendComboHit(isKo=false) -> SendFinisher
+//       * Rate limiter (g_UnackedSends > 120 -> 2s backoff)
+//       * One-target-at-a-time Aura (3s stuck skip for 5s, 120ms follow cadence)
+//       * 60s target visibility window, 120s dead hold + deadGen tracking
+//       * GhostTo always enabled with 0.25f^2 dedupe + NextRemoteTime() synced via
+//         ReliableTimeStorage.GetDouble() + incoming/outgoing displacement packets
+//   - Dual iOS AOT transport: MetaClientWrapper.Send<T> (MakeGenericMethod + MethodBase.Invoke)
+//     with automatic non-generic HostCommandWriter.WriteSend fallback if AOT strips a generic Send<T>
+//   - Real player nicknames & digital IDs synced from Morpeh ESP + ServerPlayer roster
+//   - Zero C++ exceptions (-fno-exceptions safe), zero Android APIs, TCFlyGuard + SafeMem protected
+// ============================================================================
+
 #include "CoreEngine.h"
 #include "Theme.h"
 #include <algorithm>
@@ -11,21 +26,18 @@
 #include <unordered_map>
 #include <vector>
 
-// KillAround.h — Direct iOS arm64 port of kill_around (2).h + mainTOW.cpp
-// Runs all engine/IL2CPP operations strictly on UnityMain (Tick), protected by TCFlyGuard + SafeMem.
-// Menu (DrawPanel) reads only cached game-thread snapshots.
-// Dual transport: generic MetaClientWrapper.Send<T> + automatic non-generic HostCommandWriter.WriteSend fallback for iOS AOT.
-
 namespace KillAround {
 
-static constexpr float   kMeleeReach     = 4.2f;
-static constexpr int64_t kDeadHoldMs     = 15000;
-static constexpr int32_t kOneHitDamage   = 100000;
+// ---------------- Feature state (exact kill_around (3).h defaults) ----------------
+static constexpr float   kMeleeReach   = 4.2f;     // server accepts melee hits inside 4.2m (3D)
+static constexpr int64_t kDeadHoldMs   = 120000;   // 2 min dead hold after PedDeadDatagram
+static constexpr int32_t kOneHitDamage = 100000;
 
-inline bool                 g_OutOfReach    = false;
-inline int32_t              g_SelectedId    = 0;
-inline std::atomic<int64_t> g_kaKillAllBurstUntilMs{0}; // g_BurstUntilMs
+inline bool                 g_OutOfReach = false;
+inline int32_t              g_SelectedId = 0;
+inline std::atomic<int64_t> g_BurstUntilMs{0};
 
+// ---------------- Layouts (pack 1, exact offsets from dump1.4.1.cpp) ----------------
 struct EntityId {
     int32_t Id;
     int32_t Gen;
@@ -84,7 +96,8 @@ struct DisplacementDatagram {
 static_assert(sizeof(DisplacementDatagram) == 0x40, "DisplacementDatagram layout");
 #pragma pack(pop)
 
-inline int64_t GetMonotonicMs() {
+// ---------------- Clocks ----------------
+inline int64_t MonoMs() {
     struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000LL + static_cast<int64_t>(ts.tv_nsec / 1000000LL);
@@ -99,16 +112,19 @@ inline uint64_t ComboTimestamp() {
     return (ticks & 0x3fffffffffffffffULL) | 0x4000000000000000ULL;
 }
 
+// ---------------- Tracked elements & names ----------------
 struct Tracked {
     Vec3    pos{0.0f, 0.0f, 0.0f};
-    int32_t gen = 1;
-    int64_t seenMs = 0;
+    int32_t gen         = 1;
+    int64_t seenMs      = 0;
     int64_t deadUntilMs = 0;
+    int32_t deadGen     = 0;
 };
 
 inline std::mutex                              g_Mtx;
 inline std::unordered_map<int32_t, Tracked>    g_Elems;
 inline std::unordered_map<int32_t, std::string> g_ElemNames;
+inline std::unordered_map<int32_t, int32_t>    g_ElemDigi;
 
 inline std::atomic<int32_t> g_LocalId{0};
 inline std::atomic<int32_t> g_LocalGen{1};
@@ -116,6 +132,11 @@ inline std::atomic<int32_t> g_MeleeOwnFlag{0};
 inline int64_t              g_LastDeadMs = 0;
 inline int32_t              g_LastDeadId = 0;
 inline std::atomic<int32_t> g_AcceptedHits{0};
+inline int32_t              g_UnackedSends = 0;
+inline int32_t              g_LastAccSeen = 0;
+inline int64_t              g_AuraPauseUntilMs = 0;
+
+// Diagnostics
 inline std::atomic<int32_t> g_DispHits{0};
 inline std::atomic<int32_t> g_DeadHits{0};
 inline std::atomic<int32_t> g_WriteHits{0};
@@ -123,24 +144,162 @@ inline std::atomic<int32_t> g_AttackWrites{0};
 inline std::atomic<int32_t> g_SendCalls{0};
 inline std::atomic<int32_t> g_SendOk{0};
 inline std::atomic<int32_t> g_SendFail{0};
-inline std::atomic<int32_t> g_TxMode{0}; // 0=init, 1=generic, 2=raw wire
+inline std::atomic<int32_t> g_TxMode{0}; // 0=init, 1=Gen, 2=Wire
 
 inline uint8_t              g_MeleeTemplate[0x40]{};
 inline std::atomic<bool>    g_HasMeleeTemplate{false};
 
-// Client capture (HWBP Poll + GlobalContextCore.MetaClientWrapper + SimpleDImple + Poll hook)
+// Client capture (Poll HWBP + GlobalContextCore.MetaClientWrapper + SimpleDImple)
 inline std::atomic<void*>   g_metaClient{nullptr};
 inline void*                g_KaClient = nullptr;
 inline int64_t              g_KaClientTryMs = 0;
 
-// Cached datagram Il2CppClass* for unbox normalization & lock-free HWBP access
-inline void*                g_kaClsPedDisp  = nullptr;
-inline void*                g_kaClsPedDead  = nullptr;
-inline void*                g_kaClsMeleeAtk = nullptr;
-inline void*                g_kaClsMeleeReq = nullptr;
-inline std::atomic<void*>   g_clsPedDispAtomic{nullptr};
-inline std::atomic<void*>   g_clsMeleeReqAtomic{nullptr};
+// ReliableTimeStorage (server reliable double clock)
+inline void*                g_ReliableTimeInst = nullptr;
+inline void*                g_ReliableTimeGetDoubleM = nullptr;
+inline int64_t              g_ReliableTimeTryMs = 0;
 
+// Cached datagram Il2CppClass* (also atomic copies for lock-free HWBP)
+inline void*                g_ClsPedDisp  = nullptr;
+inline void*                g_ClsPedDead  = nullptr;
+inline void*                g_ClsMeleeAtk = nullptr;
+inline void*                g_ClsMeleeReq = nullptr;
+inline std::atomic<void*>   g_ClsPedDispAtomic{nullptr};
+inline std::atomic<void*>   g_ClsMeleeReqAtomic{nullptr};
+
+// ---------------- Remote time tracking (exact kill_around (3).h + ReliableTimeStorage) ----------------
+inline std::atomic<double>  g_IncomingRemoteTime{0.0};
+inline std::atomic<int64_t> g_IncomingRemoteMs{0};
+inline double               g_LastRemoteTime = 0.0;
+inline bool                 g_GhostActive    = false;
+inline int64_t              g_GhostHoldUntil = 0;
+inline Vec3                 g_LastGhostDest{};
+
+// ---------------- Tick & Aura selection state (exact kill_around (3).h) ----------------
+inline int64_t              g_LastFollowMs = 0;
+inline bool                 g_AuraOwned    = false;
+inline int64_t              g_AuraPickMs   = 0;
+inline std::unordered_map<int32_t, int64_t> g_AuraSkipUntil;
+inline int32_t              g_CurTargetGen = 1;
+inline float                g_CurTargetDist = 0.0f;
+
+// Local position cache (written on UnityMain Tick, read by menu)
+inline std::mutex           g_LocalPosMtx;
+inline bool                 g_LocalPosOk = false;
+inline Vec3                 g_LocalPosCache{};
+inline int64_t              g_LocalPosMs = 0;
+
+// ---------------- Name & Digital ID helpers ----------------
+inline bool LookupName(int32_t elemId, std::string* out) {
+    std::lock_guard<std::mutex> lk(g_Mtx);
+    auto it = g_ElemNames.find(elemId);
+    if (it == g_ElemNames.end() || it->second.empty()) return false;
+    if (out) *out = it->second;
+    return true;
+}
+
+inline int32_t DigiForElem(int32_t elemId) {
+    std::lock_guard<std::mutex> lk(g_Mtx);
+    auto it = g_ElemDigi.find(elemId);
+    return (it != g_ElemDigi.end()) ? it->second : 0;
+}
+
+// ---------------- Client & Clock resolution ----------------
+inline void* ResolveMetaClientFromGlobals() {
+    if (!Il2Cpp::Init()) return nullptr;
+    if (void* c = Il2Cpp::ResolveStaticClassFieldPtr("dev.Scripts.GlobalContexts", "GlobalContextCore", "MetaClientWrapper")) {
+        if (Il2Cpp::IsUnityObjectSafe(c)) return c;
+    }
+    return Morpeh::EnsureMetaClientResolved();
+}
+
+inline void* ClientForSend() {
+    if (Il2Cpp::IsUnityObjectSafe(g_KaClient)) return g_KaClient;
+    void* polled = g_metaClient.load(std::memory_order_acquire);
+    if (Il2Cpp::IsUnityObjectSafe(polled)) {
+        g_KaClient = polled;
+        return g_KaClient;
+    }
+    const int64_t now = MonoMs();
+    if (now - g_KaClientTryMs < 400) return nullptr;
+    g_KaClientTryMs = now;
+    void* c = ResolveMetaClientFromGlobals();
+    if (Il2Cpp::IsUnityObjectSafe(c)) {
+        g_KaClient = c;
+        if (!g_metaClient.load(std::memory_order_relaxed)) {
+            g_metaClient.store(c, std::memory_order_release);
+        }
+    }
+    return g_KaClient;
+}
+
+inline void PrecacheDatagramClassesOnce() {
+    if (!Il2Cpp::Init()) return;
+    if (!g_ClsPedDisp) {
+        g_ClsPedDisp = Il2Cpp::FindClass(Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+        if (g_ClsPedDisp) g_ClsPedDispAtomic.store(g_ClsPedDisp, std::memory_order_release);
+    }
+    if (!g_ClsMeleeReq) {
+        g_ClsMeleeReq = Il2Cpp::FindClass(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+        if (g_ClsMeleeReq) g_ClsMeleeReqAtomic.store(g_ClsMeleeReq, std::memory_order_release);
+    }
+}
+
+inline void RecordIncomingRemoteTime(double rt, int64_t monoNow) {
+    if (!std::isfinite(rt) || rt <= 10.0 || rt >= 1e9) return;
+    g_IncomingRemoteTime.store(rt, std::memory_order_release);
+    g_IncomingRemoteMs.store(monoNow, std::memory_order_release);
+}
+
+inline double ReadReliableTimeDouble() {
+    if (!Il2Cpp::Init()) return 0.0;
+    const int64_t now = MonoMs();
+    if (!Il2Cpp::IsUnityObjectSafe(g_ReliableTimeInst) && (now - g_ReliableTimeTryMs) >= 500) {
+        g_ReliableTimeTryMs = now;
+        g_ReliableTimeInst = Morpeh::ResolveFromSimpleDImple(
+            "dev.Scripts.ECS.Morpeh.Features.ReliableTimeFeature.Systems", "ReliableTimeStorage");
+        if (!g_ReliableTimeGetDoubleM) {
+            g_ReliableTimeGetDoubleM = Il2Cpp::ResolveMethod(
+                "dev.Scripts.ECS.Morpeh.Features.ReliableTimeFeature.Systems", "ReliableTimeStorage", "GetDouble", 0);
+        }
+    }
+    if (!Il2Cpp::IsUnityObjectSafe(g_ReliableTimeInst)) return 0.0;
+
+    if (g_ReliableTimeGetDoubleM && Il2Cpp::g_api.object_unbox) {
+        if (void* boxed = Il2Cpp::SafeInvoke(g_ReliableTimeGetDoubleM, g_ReliableTimeInst, nullptr)) {
+            double v = 0.0;
+            if (SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxed), v) && std::isfinite(v) && v > 10.0 && v < 1e9) {
+                RecordIncomingRemoteTime(v, now);
+                return v;
+            }
+        }
+    }
+    double cached = 0.0;
+    if (SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(g_ReliableTimeInst) + 0x20, cached) &&
+        std::isfinite(cached) && cached > 10.0 && cached < 1e9) {
+        RecordIncomingRemoteTime(cached, now);
+        return cached;
+    }
+    return 0.0;
+}
+
+inline double NextRemoteTime() {
+    const int64_t mono = MonoMs();
+    double now = ReadReliableTimeDouble();
+    if (now <= 10.0) {
+        const int64_t incMs = g_IncomingRemoteMs.load(std::memory_order_acquire);
+        const double  incRt = g_IncomingRemoteTime.load(std::memory_order_acquire);
+        now = (incMs != 0 && incRt > 10.0)
+            ? (incRt + static_cast<double>(mono - incMs) / 1000.0)
+            : (static_cast<double>(mono) / 1000.0);
+    }
+    double t = g_LastRemoteTime + 0.001;
+    if (now > t) t = now;
+    g_LastRemoteTime = t;
+    return t;
+}
+
+// ---------------- Dual Transport: Generic Send<T> + Non-Generic Wire Fallback ----------------
 struct SendEntry {
     const char* name = nullptr;
     const char* ns = nullptr;
@@ -175,119 +334,6 @@ struct WireCtx {
 };
 inline WireCtx g_Wire{};
 
-inline std::atomic<double> g_LastRemoteTime{0.0};
-inline bool      g_kaHasActiveGhost = false; // g_GhostActive
-inline int64_t   g_GhostHoldUntil = 0;
-
-inline int64_t   g_LastAuraMs = 0;
-inline int64_t   g_LastFollowMs = 0;
-inline std::unordered_map<int32_t, int64_t> g_AuraLast;
-inline size_t    g_AuraCursor = 0;
-inline int32_t   g_CurTargetGen = 1;
-inline float     g_CurTargetDist = 0.0f;
-
-inline std::mutex g_LocalPosMtx;
-inline bool       g_LocalPosOk = false;
-inline Vec3       g_LocalPosCache{};
-inline int64_t    g_LocalPosMs = 0;
-
-inline void RecordRemoteTime(double rt) {
-    if (!std::isfinite(rt) || rt <= 1000.0 || rt >= 1e9) return;
-    double cur = g_LastRemoteTime.load(std::memory_order_relaxed);
-    while (rt > cur) {
-        if (g_LastRemoteTime.compare_exchange_weak(cur, rt, std::memory_order_release, std::memory_order_relaxed)) {
-            break;
-        }
-    }
-}
-
-inline double AdvanceRemoteTime(double deltaSec) {
-    double cur = g_LastRemoteTime.load(std::memory_order_acquire);
-    double next = (cur > 0.0 ? cur : 1.0) + deltaSec;
-    g_LastRemoteTime.store(next, std::memory_order_release);
-    return next;
-}
-
-inline bool LookupName(int32_t elemId, std::string* out) {
-    std::lock_guard<std::mutex> lk(g_Mtx);
-    auto it = g_ElemNames.find(elemId);
-    if (it == g_ElemNames.end() || it->second.empty()) return false;
-    if (out) *out = it->second;
-    return true;
-}
-
-inline void* ResolveMetaClientFromGlobals() {
-    if (!Il2Cpp::Init()) return nullptr;
-    if (void* c = Il2Cpp::ResolveStaticClassFieldPtr("dev.Scripts.GlobalContexts", "GlobalContextCore", "MetaClientWrapper")) {
-        if (Il2Cpp::IsUnityObjectSafe(c)) return c;
-    }
-    return Morpeh::EnsureMetaClientResolved();
-}
-
-inline void* ClientForSend() {
-    if (Il2Cpp::IsUnityObjectSafe(g_KaClient)) return g_KaClient;
-    void* polled = g_metaClient.load(std::memory_order_acquire);
-    if (Il2Cpp::IsUnityObjectSafe(polled)) {
-        g_KaClient = polled;
-        return g_KaClient;
-    }
-    const int64_t now = GetMonotonicMs();
-    if (now - g_KaClientTryMs < 400) return nullptr;
-    g_KaClientTryMs = now;
-    void* c = ResolveMetaClientFromGlobals();
-    if (Il2Cpp::IsUnityObjectSafe(c)) {
-        g_KaClient = c;
-        if (!g_metaClient.load(std::memory_order_relaxed)) {
-            g_metaClient.store(c, std::memory_order_release);
-        }
-    }
-    return g_KaClient;
-}
-
-inline void PrecacheDatagramClassesOnce() {
-    if (!Il2Cpp::Init()) return;
-    if (!g_kaClsPedDisp) {
-        g_kaClsPedDisp = Il2Cpp::FindClass(Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
-        if (g_kaClsPedDisp) g_clsPedDispAtomic.store(g_kaClsPedDisp, std::memory_order_release);
-    }
-    if (!g_kaClsMeleeReq) {
-        g_kaClsMeleeReq = Il2Cpp::FindClass(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
-        if (g_kaClsMeleeReq) g_clsMeleeReqAtomic.store(g_kaClsMeleeReq, std::memory_order_release);
-    }
-}
-
-// Compute/seed exact server RemoteTime from MetaClientWrapper.GetServerTime() - TimeConstants.ZeroTimestampDatetime
-inline void SyncServerTimeFallback(void* client) {
-    if (g_LastRemoteTime.load(std::memory_order_acquire) > 1000.0) return;
-    if (!Il2Cpp::IsUnityObjectSafe(client) || !Il2Cpp::Init()) return;
-
-    static void* s_getSrvTimeM = nullptr;
-    static void* s_getZeroDtM  = nullptr;
-    static bool  s_resolved    = false;
-    if (!s_resolved) {
-        s_resolved    = true;
-        s_getSrvTimeM = Il2Cpp::ResolveMethod("FlakeFlow", "MetaClientWrapper", "GetServerTime", 0);
-        s_getZeroDtM  = Il2Cpp::ResolveMethod("FlakeFlow", "TimeConstants", "get_ZeroTimestampDatetime", 0);
-    }
-    if (!s_getSrvTimeM || !s_getZeroDtM || !Il2Cpp::g_api.object_unbox) return;
-
-    void* boxedSrv  = Il2Cpp::SafeInvoke(s_getSrvTimeM, client, nullptr);
-    void* boxedZero = Il2Cpp::SafeInvoke(s_getZeroDtM, nullptr, nullptr);
-    if (!boxedSrv || !boxedZero) return;
-
-    uint64_t srvData = 0, zeroData = 0;
-    if (!SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedSrv), srvData)) return;
-    if (!SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedZero), zeroData)) return;
-
-    const uint64_t srvTicks  = srvData  & 0x3FFFFFFFFFFFFFFFULL;
-    const uint64_t zeroTicks = zeroData & 0x3FFFFFFFFFFFFFFFULL;
-    if (srvTicks > zeroTicks) {
-        const double rt = static_cast<double>(srvTicks - zeroTicks) / 10000000.0;
-        RecordRemoteTime(rt);
-    }
-}
-
-// Initializes non-generic FlakeFlow wire pipeline (IBNet_Writer + NumberSerializer + HostCommandWriter.WriteSend)
 inline bool EnsureWireCtxReady() {
     if (g_Wire.ready) return true;
     if (g_Wire.tried) return false;
@@ -298,12 +344,12 @@ inline bool EnsureWireCtxReady() {
         return false;
     }
 
-    void* mcK   = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
-    void* ffK   = Il2Cpp::FindClass("FlakeFlow", "FlakeFlowClient");
-    void* ppK   = Il2Cpp::FindClass("FlakeFlow", "ClientPeerProvider");
-    void* hcwK  = Il2Cpp::FindClass("FlakeFlow", "HostCommandWriter");
-    void* wK    = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "IBNet_Writer");
-    void* nsK   = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "NumberSerializer");
+    void* mcK  = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
+    void* ffK  = Il2Cpp::FindClass("FlakeFlow", "FlakeFlowClient");
+    void* ppK  = Il2Cpp::FindClass("FlakeFlow", "ClientPeerProvider");
+    void* hcwK = Il2Cpp::FindClass("FlakeFlow", "HostCommandWriter");
+    void* wK   = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "IBNet_Writer");
+    void* nsK  = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "NumberSerializer");
     if (!mcK || !ffK || !ppK || !hcwK || !wK || !nsK) return false;
 
     g_Wire.offMcHandler   = Il2Cpp::FieldOffset(mcK, "_datagramHandler", 0x28);
@@ -341,7 +387,6 @@ inline bool EnsureWireCtxReady() {
     return g_Wire.ready;
 }
 
-// Looks up exact PacketId and NetChannel from static FlakeFlow.MetaTypeInfo.IdToInfo dictionary
 inline bool LookupMetaTypeInfo(void* dgramKlass, const char* ns, const char* dgramName, uint64_t& outPacketId, uint8_t& outChannel) {
     if (!Il2Cpp::Init() || !dgramKlass) return false;
 
@@ -381,8 +426,7 @@ inline bool LookupMetaTypeInfo(void* dgramKlass, const char* ns, const char* dgr
                         void* mtiObj = nullptr;
                         SafeMem::ReadVal(ent + 0x10, mtiObj);
                         if (!Il2Cpp::IsUnityObjectSafe(mtiObj)) continue;
-                        void* entryType = SafeMem::PtrAt(mtiObj, offType);
-                        if (entryType == dgTypeObj) {
+                        if (SafeMem::PtrAt(mtiObj, offType) == dgTypeObj) {
                             uint64_t pid = 0;
                             uint8_t  ch  = 16;
                             SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(mtiObj) + offId, pid);
@@ -399,15 +443,12 @@ inline bool LookupMetaTypeInfo(void* dgramKlass, const char* ns, const char* dgr
         }
     }
 
-    // Fallback via FlakeFlow.HashUtility.Fnv1A64("Namespace.TypeName")
     if (void* fnvM = Il2Cpp::ResolveMethod("FlakeFlow", "HashUtility", "Fnv1A64", 1)) {
         if (Il2Cpp::g_api.string_new && Il2Cpp::g_api.object_unbox) {
             std::string fullName = (ns && ns[0]) ? (std::string(ns) + "." + dgramName) : std::string(dgramName);
-            void* sObj = Il2Cpp::g_api.string_new(fullName.c_str());
-            if (sObj) {
+            if (void* sObj = Il2Cpp::g_api.string_new(fullName.c_str())) {
                 void* args[1] = { sObj };
-                void* boxedHash = Il2Cpp::SafeInvoke(fnvM, nullptr, args);
-                if (boxedHash) {
+                if (void* boxedHash = Il2Cpp::SafeInvoke(fnvM, nullptr, args)) {
                     uint64_t pid = 0;
                     if (SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedHash), pid) && pid != 0) {
                         outPacketId = pid;
@@ -421,8 +462,7 @@ inline bool LookupMetaTypeInfo(void* dgramKlass, const char* ns, const char* dgr
     return false;
 }
 
-// Non-generic wire path (zero MakeGenericMethod, works 100% in iOS Full AOT for any datagram type)
-inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, size_t payloadSize) {
+inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box) {
     if (!e || e->wireFailed || !Il2Cpp::IsUnityObjectSafe(clientObj)) return false;
     if (!EnsureWireCtxReady()) return false;
 
@@ -437,7 +477,7 @@ inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, siz
             e->wireFailed = true;
             return false;
         }
-        void* writeM = Il2Cpp::g_api.class_get_method_from_name(e->dgramKlass, "Write", 1);
+        void* writeM  = Il2Cpp::g_api.class_get_method_from_name(e->dgramKlass, "Write", 1);
         void* writeFn = writeM ? SafeMem::PtrAt(writeM, 0) : nullptr;
         if (!writeM || !SafeMem::IsPlausiblePtr(writeFn)) {
             e->wireFailed = true;
@@ -451,7 +491,6 @@ inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, siz
 
     void* ffClient = SafeMem::PtrAt(clientObj, g_Wire.offMcClient);
     if (!Il2Cpp::IsUnityObjectSafe(ffClient)) return false;
-
     void* peerProv  = SafeMem::PtrAt(ffClient, g_Wire.offFfPeerProv);
     void* cmdWriter = SafeMem::PtrAt(ffClient, g_Wire.offFfCmdWriter);
     if (!Il2Cpp::IsUnityObjectSafe(peerProv) || !Il2Cpp::IsUnityObjectSafe(cmdWriter)) return false;
@@ -467,7 +506,6 @@ inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, siz
     if (!Il2Cpp::IsUnityObjectSafe(writerObj)) return false;
 
     bool ok = false;
-    (void)payloadSize;
     TCFlyGuard::TryRun([&]() {
         Il2Cpp::EnsureThreadAttached();
         void* exc = nullptr;
@@ -497,13 +535,10 @@ inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, siz
         Il2Cpp::g_api.runtime_invoke(g_Wire.cmdWriterWriteSendM, cmdWriter, sendArgs, &exc);
         ok = (exc == nullptr);
     });
-    if (ok) {
-        g_TxMode.store(2, std::memory_order_release);
-    }
+    if (ok) g_TxMode.store(2, std::memory_order_release);
     return ok;
 }
 
-// Generic MetaClientWrapper.Send<T> primary + automatic raw HostCommandWriter.WriteSend fallback
 inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* payload, size_t payloadSize) {
     void* client = ClientForSend();
     if (!Il2Cpp::IsUnityObjectSafe(client) || payloadSize > 0x200) return false;
@@ -526,6 +561,7 @@ inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* 
     uint8_t box[0x200]{};
     if (payload && payloadSize > 0) std::memcpy(box, payload, payloadSize);
 
+    // Primary path: exact kill_around (3).h MetaClientWrapper.Send<T>
     if (!e->genFailed && Il2Cpp::g_api.value_box && Il2Cpp::g_api.array_new &&
         Il2Cpp::g_api.method_get_object && Il2Cpp::g_api.gchandle_new && Il2Cpp::g_api.gchandle_get_target) {
         bool ok = false;
@@ -535,11 +571,11 @@ inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* 
             if (e->methodGch == 0) {
                 void* wrapperK = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
                 if (!e->dgramKlass) e->dgramKlass = Il2Cpp::FindClass(ns, dgramName);
-                void* typeK    = Il2Cpp::FindClass("System", "Type");
+                void* typeK = Il2Cpp::FindClass("System", "Type");
                 if (!g_ObjectKlass) g_ObjectKlass = Il2Cpp::FindClass("System", "Object");
-                void* miK      = Il2Cpp::FindClass("System.Reflection", "MethodInfo");
-                void* rmiK     = Il2Cpp::FindClass("System.Reflection", "RuntimeMethodInfo");
-                void* mbK      = Il2Cpp::FindClass("System.Reflection", "MethodBase");
+                void* miK   = Il2Cpp::FindClass("System.Reflection", "MethodInfo");
+                void* rmiK  = Il2Cpp::FindClass("System.Reflection", "RuntimeMethodInfo");
+                void* mbK   = Il2Cpp::FindClass("System.Reflection", "MethodBase");
                 if (!wrapperK || !e->dgramKlass || !typeK || !g_ObjectKlass || !miK || !mbK) {
                     e->genFailed = true;
                     return;
@@ -598,8 +634,8 @@ inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* 
         }
     }
 
-    // Fallback to raw HostCommandWriter.WriteSend when AOT generic MakeGenericMethod/Invoke is unavailable
-    return SendDatagramRawWire(client, e, box, payloadSize);
+    // Automatic non-generic HostCommandWriter.WriteSend fallback for iOS Full AOT
+    return SendDatagramRawWire(client, e, box);
 }
 
 inline bool SendDatagram(const char* ns, const char* dgramName, const void* payload, size_t payloadSize) {
@@ -609,6 +645,7 @@ inline bool SendDatagram(const char* ns, const char* dgramName, const void* payl
     return ok;
 }
 
+// ---------------- Combat packets (exact kill_around (3).h) ----------------
 inline bool SendComboHit(int32_t targetId, int32_t targetGen, bool isKo, uint64_t ts, const float* dir, int32_t attackType) {
     RequestDatagram r{};
     r.element    = { g_LocalId.load(std::memory_order_relaxed), g_LocalGen.load(std::memory_order_relaxed) };
@@ -648,16 +685,17 @@ inline bool SendOneHitRaw(int32_t targetId, int32_t targetGen, const float* dir)
     if (g_HasMeleeTemplate.load(std::memory_order_acquire)) {
         std::memcpy(&m, g_MeleeTemplate, sizeof(m));
     }
-    m.element         = { g_LocalId.load(std::memory_order_relaxed), g_LocalGen.load(std::memory_order_relaxed) };
-    m.target          = { targetId, targetGen > 0 ? targetGen : 1 };
-    m.damage          = 1000;
-    m.damageToStamina = 0;
-    m.trace[0] = dir[0]; m.trace[1] = dir[1]; m.trace[2] = dir[2];
-    m.heightType      = 0;
-    m.direction       = 2;
-    m.attackType      = 2;
-    m.isKo            = 1;
-    m.timestamp       = ComboTimestamp();
+    m.element    = { g_LocalId.load(std::memory_order_relaxed), g_LocalGen.load(std::memory_order_relaxed) };
+    m.target     = { targetId, targetGen > 0 ? targetGen : 1 };
+    m.damage     = 1000;
+    m.trace[0]   = dir[0];
+    m.trace[1]   = dir[1];
+    m.trace[2]   = dir[2];
+    m.heightType = 0;
+    m.direction  = 2;
+    m.attackType = 2;
+    m.isKo       = 1;
+    m.timestamp  = ComboTimestamp();
     return SendDatagram(Offsets::g_cfg.nsWeaponDatagrams.c_str(),
                         "MeleeWeaponAttackDatagram", &m, sizeof(m));
 }
@@ -673,6 +711,7 @@ inline bool SendDisplacement(const Vec3& at, double remoteTime) {
                         "PedDisplacementSyncDatagram", &d, sizeof(d));
 }
 
+// ---------------- Position, candidates, ghost step & burst ----------------
 inline bool LocalPos(Vec3& out) {
     int64_t ped = Morpeh::GetLocalPedEntity();
     if (ped <= 0) return false;
@@ -721,13 +760,13 @@ struct Candidate {
 
 inline std::vector<Candidate> Candidates(const Vec3& me, float radius, int64_t now, bool withDead = false) {
     std::vector<Candidate> out;
-    int32_t myId = g_LocalId.load(std::memory_order_relaxed);
+    const int32_t myId = g_LocalId.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_Mtx);
     for (const auto& kv : g_Elems) {
         const int32_t id = kv.first;
         const Tracked& t = kv.second;
         if (id < 1 || id == myId) continue;
-        if ((now - t.seenMs) > 10000) continue;
+        if ((now - t.seenMs) > 60000) continue; // 60s window for stationary targets
         const bool dead = t.deadUntilMs > now;
         if (dead && !withDead) continue;
         const float dx = t.pos.x - me.x, dy = t.pos.y - me.y, dz = t.pos.z - me.z;
@@ -748,20 +787,25 @@ inline Vec3 StandPos(const Vec3& me, const Vec3& tgt, float offset) {
 
 inline void GhostTo(const Vec3& tgt, const Vec3& me) {
     Vec3 dest = StandPos(me, tgt, 0.45f);
-    if (g_LastRemoteTime.load(std::memory_order_acquire) <= 1000.0) {
-        SyncServerTimeFallback(ClientForSend());
+    if (g_GhostActive) {
+        const float dx = dest.x - g_LastGhostDest.x;
+        const float dy = dest.y - g_LastGhostDest.y;
+        const float dz = dest.z - g_LastGhostDest.z;
+        if (dx * dx + dy * dy + dz * dz < 0.25f) {
+            g_GhostHoldUntil = MonoMs() + 200;
+            return;
+        }
     }
-    double rt = AdvanceRemoteTime(0.025);
-    SendDisplacement(dest, rt);
-    g_kaHasActiveGhost = true;
-    g_GhostHoldUntil = GetMonotonicMs() + 200;
+    SendDisplacement(dest, NextRemoteTime());
+    g_LastGhostDest  = dest;
+    g_GhostActive    = true;
+    g_GhostHoldUntil = MonoMs() + 200;
 }
 
 inline void GhostRestore(const Vec3& me) {
-    if (!g_kaHasActiveGhost) return;
-    double rt = AdvanceRemoteTime(0.025);
-    SendDisplacement(me, rt);
-    g_kaHasActiveGhost = false;
+    if (!g_GhostActive) return;
+    SendDisplacement(me, NextRemoteTime());
+    g_GhostActive = false;
 }
 
 inline int Burst(int32_t id, int32_t gen, int hits) {
@@ -777,10 +821,12 @@ inline int Burst(int32_t id, int32_t gen, int hits) {
     int sent = 0;
     if (g_cfgState.bKillAroundOneHit && SendOneHitRaw(id, gen, dir)) ++sent;
     for (int i = 0; i < hits; ++i) {
-        if (SendComboHit(id, gen, true, ComboTimestamp(), dir, (i % 3 == 2) ? 2 : 0)) ++sent;
+        // Exact kill_around (3).h: isKo = false on combo hits, knockout only on finisher/one-hit
+        if (SendComboHit(id, gen, false, ComboTimestamp(), dir, (i % 3 == 2) ? 2 : 0)) ++sent;
     }
     float hitPos[3] = { tp.x, tp.y + 0.9f, tp.z };
     if (SendFinisher(id, gen, hitPos, dir)) ++sent;
+    g_UnackedSends += sent;
     return sent;
 }
 
@@ -813,8 +859,8 @@ inline bool EnsureLocalIdCached() {
     return false;
 }
 
-// Syncs streamed Morpeh players into g_Elems + g_ElemNames on UnityMain (~6.5Hz)
-inline void SyncStreamedRosterOnGameThread(int64_t now) {
+// ---------------- Roster, Player Names & Digital IDs Sync (UnityMain) ----------------
+inline void SyncRosterAndNamesOnGameThread(int64_t now) {
     static int64_t s_lastSyncMs = 0;
     if (now - s_lastSyncMs < 150) return;
     s_lastSyncMs = now;
@@ -823,15 +869,40 @@ inline void SyncStreamedRosterOnGameThread(int64_t now) {
     int64_t localPed = Morpeh::GetLocalPedEntity();
     int32_t localPedId = (localPed > 0) ? Morpeh::UnpackEntityId(localPed) : -1;
 
-    std::vector<ESPPlayer> snap;
+    std::vector<ESPPlayer> streamedSnap;
+    std::vector<ServerPlayerEntry> serverSnap;
     {
         std::lock_guard<std::mutex> lk(::g_espMutex);
-        snap = ::g_renderPlayers;
+        streamedSnap = ::g_renderPlayers;
+        serverSnap   = ::g_allServerPlayers;
     }
-    if (snap.empty()) return;
 
     std::lock_guard<std::mutex> lk(g_Mtx);
-    for (const auto& pl : snap) {
+    for (const auto& sp : serverSnap) {
+        if (sp.pedId < 0 || sp.pedId == localPedId) continue;
+        EntityId eid{};
+        void* ep = Morpeh::Get(Morpeh::g_stashes.elementIdStash, sp.pedId, sizeof(EntityId));
+        if (!ep || !SafeMem::ReadVal(ep, eid) || eid.Id < 1) continue;
+        if (!sp.name.empty()) g_ElemNames[eid.Id] = sp.name;
+        if (sp.digitalId > 0) g_ElemDigi[eid.Id] = static_cast<int32_t>(sp.digitalId);
+        if (sp.isStreamed && IsFiniteVec3(sp.worldPos) && (std::fabs(sp.worldPos.x) > 0.1f || std::fabs(sp.worldPos.z) > 0.1f)) {
+            Tracked& t = g_Elems[eid.Id];
+            t.pos = sp.worldPos;
+            const int32_t newGen = eid.Gen > 0 ? eid.Gen : 1;
+            if (t.deadGen != 0 && newGen != t.deadGen) {
+                t.deadUntilMs = 0;
+                t.deadGen = 0;
+            }
+            t.gen    = newGen;
+            t.seenMs = now;
+            if (sp.health <= 0 && t.deadUntilMs <= now) {
+                t.deadUntilMs = now + 5000;
+                t.deadGen = newGen;
+            }
+        }
+    }
+
+    for (const auto& pl : streamedSnap) {
         if (pl.entityId < 0 || pl.entityId == localPedId) continue;
         if (pl.playerId < 0 && !g_cfgState.bKillAroundIncludeNpcs) continue;
         EntityId eid{};
@@ -840,10 +911,16 @@ inline void SyncStreamedRosterOnGameThread(int64_t now) {
 
         Tracked& t = g_Elems[eid.Id];
         t.pos = pl.worldPos;
-        t.gen = eid.Gen > 0 ? eid.Gen : 1;
+        const int32_t newGen = eid.Gen > 0 ? eid.Gen : 1;
+        if (t.deadGen != 0 && newGen != t.deadGen) {
+            t.deadUntilMs = 0;
+            t.deadGen = 0;
+        }
+        t.gen    = newGen;
         t.seenMs = now;
-        if ((pl.dead || pl.health <= 0) && t.deadUntilMs < now + 3000) {
-            t.deadUntilMs = now + 3000;
+        if ((pl.dead || pl.health <= 0) && t.deadUntilMs <= now) {
+            t.deadUntilMs = now + 5000;
+            t.deadGen = newGen;
         }
         if (!pl.name.empty()) {
             g_ElemNames[eid.Id] = pl.name;
@@ -851,21 +928,21 @@ inline void SyncStreamedRosterOnGameThread(int64_t now) {
     }
 }
 
-// ---------------- Lock-free HWBP Capture Helpers (NO mutexes, NO IL2CPP calls) ----------------
+// ---------------- Lock-free HWBP Capture Helpers (Mach Exception Thread Safe) ----------------
 inline void OnPedDispWriteLockFree(uint64_t x0) {
     if (x0 < 0x100000000ULL) return;
     void* ptr = reinterpret_cast<void*>(x0);
     DisplacementDatagram d{};
     if (!SafeMem::ReadVal(ptr, d)) return;
-    void* dispCls = g_clsPedDispAtomic.load(std::memory_order_acquire);
+    void* dispCls = g_ClsPedDispAtomic.load(std::memory_order_acquire);
     if (dispCls && SafeMem::PtrAt(ptr, 0) == dispCls) {
         if (!SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(ptr) + 0x10, d)) return;
     }
     if (d.remoteId.Id >= 1 && d.remoteId.Gen >= 1 && d.remoteId.Gen <= 1000000 &&
-        std::isfinite(d.remoteTime) && d.remoteTime > 1000.0 && d.remoteTime < 1e9) {
+        std::isfinite(d.remoteTime) && d.remoteTime > 10.0 && d.remoteTime < 1e9) {
         g_LocalId.store(d.remoteId.Id, std::memory_order_release);
         g_LocalGen.store(d.remoteId.Gen, std::memory_order_release);
-        RecordRemoteTime(d.remoteTime);
+        RecordIncomingRemoteTime(d.remoteTime, MonoMs());
         g_DispHits.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -873,10 +950,8 @@ inline void OnPedDispWriteLockFree(uint64_t x0) {
 inline void OnMeleeReqWriteLockFree(uint64_t x0) {
     if (x0 < 0x100000000ULL) return;
     uint8_t* ptr = reinterpret_cast<uint8_t*>(x0);
-    void* reqCls = g_clsMeleeReqAtomic.load(std::memory_order_acquire);
-    if (reqCls && SafeMem::PtrAt(ptr, 0) == reqCls) {
-        ptr += 0x10;
-    }
+    void* reqCls = g_ClsMeleeReqAtomic.load(std::memory_order_acquire);
+    if (reqCls && SafeMem::PtrAt(ptr, 0) == reqCls) ptr += 0x10;
     RequestDatagram r{};
     if (!SafeMem::ReadVal(ptr, r)) return;
     g_WriteHits.fetch_add(1, std::memory_order_relaxed);
@@ -887,7 +962,7 @@ inline void OnMeleeReqWriteLockFree(uint64_t x0) {
     if (!g_cfgState.bMasterDisable && g_cfgState.bKillAroundOneHit &&
         g_MeleeOwnFlag.load(std::memory_order_relaxed) == 0 &&
         (g_cfgState.bKillAroundAutoRepeat || g_cfgState.bKillAroundAura ||
-         g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0)) {
+         g_BurstUntilMs.load(std::memory_order_relaxed) > 0)) {
         uint8_t ko = 1;
         SafeMem::Write(ptr + offsetof(RequestDatagram, isKo), &ko, 1);
     }
@@ -918,7 +993,7 @@ inline int32_t PredictComboDamageOverride(int32_t /*attackType*/, bool isStamina
     if (isStaminaDamage || g_cfgState.bMasterDisable) return 0;
     bool active = g_cfgState.bKillAroundOneHit &&
                   (g_cfgState.bKillAroundAutoRepeat || g_cfgState.bKillAroundAura ||
-                   g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0);
+                   g_BurstUntilMs.load(std::memory_order_relaxed) > 0);
     if (active) {
         outOverride = true;
         return kOneHitDamage;
@@ -927,55 +1002,63 @@ inline int32_t PredictComboDamageOverride(int32_t /*attackType*/, bool isStamina
 }
 
 inline void OnPedDisplacementRead(const void* rawPkt) {
-    const void* ptr = NormalizeDatagramPtr(rawPkt, g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+    const void* ptr = NormalizeDatagramPtr(rawPkt, g_ClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     DisplacementDatagram d{};
     if (!SafeMem::ReadVal(ptr, d) || d.remoteId.Id < 1) return;
     Vec3 p{ d.pos[0], d.pos[1], d.pos[2] };
     if (!IsFiniteVec3(p)) return;
     g_DispHits.fetch_add(1, std::memory_order_relaxed);
-    RecordRemoteTime(d.remoteTime);
-    const int64_t now = GetMonotonicMs();
+    const int64_t now = MonoMs();
+    if (std::isfinite(d.remoteTime) && d.remoteTime > 10.0) {
+        RecordIncomingRemoteTime(d.remoteTime, now);
+    }
     std::lock_guard<std::mutex> lk(g_Mtx);
     Tracked& t = g_Elems[d.remoteId.Id];
-    t.pos    = p;
-    t.gen    = d.remoteId.Gen > 0 ? d.remoteId.Gen : 1;
+    t.pos = p;
+    const int32_t newGen = d.remoteId.Gen > 0 ? d.remoteId.Gen : 1;
+    if (t.deadGen != 0 && newGen != t.deadGen) {
+        t.deadUntilMs = 0;
+        t.deadGen = 0;
+    }
+    t.gen    = newGen;
     t.seenMs = now;
 }
 
 inline void OnPedDeadRead(const void* rawPkt) {
-    const void* ptr = NormalizeDatagramPtr(rawPkt, g_kaClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
+    const void* ptr = NormalizeDatagramPtr(rawPkt, g_ClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     int32_t id = 0;
     if (!SafeMem::ReadVal(ptr, id)) return;
     g_DeadHits.fetch_add(1, std::memory_order_relaxed);
     if (id < 1) return;
-    const int64_t now = GetMonotonicMs();
+    const int64_t now = MonoMs();
     {
         std::lock_guard<std::mutex> lk(g_Mtx);
         Tracked& t = g_Elems[id];
-        t.deadUntilMs = now + kDeadHoldMs;
+        if (t.deadUntilMs <= now) t.deadUntilMs = now + kDeadHoldMs;
+        t.deadGen = t.gen;
     }
     g_LastDeadId = id;
     g_LastDeadMs = now;
 }
 
 inline void OnMeleeAttackRead(const void* rawPkt) {
-    const void* ptr = NormalizeDatagramPtr(rawPkt, g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    const void* ptr = NormalizeDatagramPtr(rawPkt, g_ClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     MeleeHitDatagram m{};
     if (!SafeMem::ReadVal(ptr, m)) return;
     std::memcpy(g_MeleeTemplate, &m, sizeof(g_MeleeTemplate));
     g_HasMeleeTemplate.store(true, std::memory_order_release);
     if (m.target.Id < 1) return;
-    int32_t myId = g_LocalId.load(std::memory_order_relaxed);
+    const int32_t myId = g_LocalId.load(std::memory_order_relaxed);
     if (myId >= 1 && m.element.Id == myId) {
         g_AcceptedHits.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 inline void OnMeleeRequestWrite(void* rawPkt, void* /*writer*/ = nullptr) {
-    void* ptr = NormalizeDatagramPtrMut(rawPkt, g_kaClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+    void* ptr = NormalizeDatagramPtrMut(rawPkt, g_ClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     RequestDatagram r{};
     if (!SafeMem::ReadVal(ptr, r)) return;
@@ -986,14 +1069,14 @@ inline void OnMeleeRequestWrite(void* rawPkt, void* /*writer*/ = nullptr) {
     }
     if (g_cfgState.bKillAroundOneHit && g_MeleeOwnFlag.load(std::memory_order_relaxed) == 0 &&
         (g_cfgState.bKillAroundAutoRepeat || g_cfgState.bKillAroundAura ||
-         g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0)) {
+         g_BurstUntilMs.load(std::memory_order_relaxed) > 0)) {
         uint8_t ko = 1;
         SafeMem::Write(reinterpret_cast<uint8_t*>(ptr) + offsetof(RequestDatagram, isKo), &ko, 1);
     }
 }
 
 inline void OnMeleeAttackWrite(void* rawPkt, void* /*writer*/ = nullptr) {
-    void* ptr = NormalizeDatagramPtrMut(rawPkt, g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    void* ptr = NormalizeDatagramPtrMut(rawPkt, g_ClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
     if (!SafeMem::IsPlausiblePtr(ptr)) return;
     MeleeHitDatagram m{};
     if (!SafeMem::ReadVal(ptr, m)) return;
@@ -1008,8 +1091,8 @@ inline void OnMeleeAttackWrite(void* rawPkt, void* /*writer*/ = nullptr) {
     }
 }
 
-// Reads EntityMetaDatagramHandler._items -> NetworkFilter<T> without relying on AOT virtual Read hooks
-inline void SyncNetworkFiltersOnGameThread() {
+// Reads EntityMetaDatagramHandler._items -> NetworkFilter<T> directly on UnityMain
+inline void SyncNetworkFiltersOnGameThread(int64_t now) {
     static int64_t  s_lastPollMs   = 0;
     static bool     s_idsResolved  = false;
     static uint64_t s_pktDisp      = 0;
@@ -1018,7 +1101,6 @@ inline void SyncNetworkFiltersOnGameThread() {
     static uint64_t s_lastMeleeTs  = 0;
     static int32_t  s_lastDeadSeen = 0;
 
-    const int64_t now = GetMonotonicMs();
     if (now - s_lastPollMs < 60) return;
     s_lastPollMs = now;
 
@@ -1038,7 +1120,7 @@ inline void SyncNetworkFiltersOnGameThread() {
 
     void* handler = SafeMem::PtrAt(client, g_Wire.offMcHandler);
     if (!Il2Cpp::IsUnityObjectSafe(handler)) return;
-    void* dict = SafeMem::PtrAt(handler, 0x10); // EntityMetaDatagramHandler._items
+    void* dict = SafeMem::PtrAt(handler, 0x10);
     if (!Il2Cpp::IsUnityObjectSafe(dict)) return;
 
     void* dictK = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(dict) : nullptr;
@@ -1066,7 +1148,7 @@ inline void SyncNetworkFiltersOnGameThread() {
         if (!Il2Cpp::IsUnityObjectSafe(itemObj)) continue;
 
         if (key != s_pktDisp && key != s_pktDead && key != s_pktMeleeAtk) continue;
-        void* filterObj = SafeMem::PtrAt(itemObj, 0x18); // EntityMetaDatagramHandlerItem<T>._filter
+        void* filterObj = SafeMem::PtrAt(itemObj, 0x18);
         if (!Il2Cpp::IsUnityObjectSafe(filterObj)) continue;
 
         void* arr = SafeMem::PtrAt(filterObj, 0x10);
@@ -1101,9 +1183,9 @@ inline void SyncNetworkFiltersOnGameThread() {
     }
 }
 
-// ---------------- UnityMain Tick (exact kill_around (2).h) ----------------
+// ---------------- Tick (UnityMain — exact kill_around (3).h logic) ----------------
 inline void Tick() {
-    const int64_t tNow = GetMonotonicMs();
+    const int64_t tNow = MonoMs();
     PrecacheDatagramClassesOnce();
 
     // Refresh cached local position at 4 Hz for the menu (menu never touches engine)
@@ -1112,37 +1194,44 @@ inline void Tick() {
         Vec3 p{};
         const bool ok = LocalPos(p);
         std::lock_guard<std::mutex> lk(g_LocalPosMtx);
-        g_LocalPosOk = ok;
+        g_LocalPosOk    = ok;
         g_LocalPosCache = p;
     }
 
-    // Keep client + server time + datagram filters alive
-    if (void* client = ClientForSend()) {
-        SyncServerTimeFallback(client);
+    // Seed ReliableTimeStorage clock & MetaClientWrapper
+    ClientForSend();
+    if (g_IncomingRemoteMs.load(std::memory_order_acquire) == 0) {
+        ReadReliableTimeDouble();
     }
 
-    // Keep streamed roster + nicknames synced when menu KillAround tab is visible or KillAround is active
+    // Keep target roster, player names & network filters fresh when viewing or active
     const bool menuViewingKa = g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
                                g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
                                g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3;
-    const bool burstNow = g_kaKillAllBurstUntilMs.load(std::memory_order_acquire) > tNow;
+    const bool burstNow = g_BurstUntilMs.load(std::memory_order_acquire) > tNow;
     if (menuViewingKa || g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat || burstNow) {
-        SyncStreamedRosterOnGameThread(tNow);
-        SyncNetworkFiltersOnGameThread();
+        SyncRosterAndNamesOnGameThread(tNow);
+        SyncNetworkFiltersOnGameThread(tNow);
     }
 
-    // New local ped = relog / respawn into new world -> reset active session safely
+    // New local ped = relog / respawn into new world -> reset session & drop stale targets
     {
         int64_t curPed = Morpeh::GetLocalPedEntity();
         static int64_t s_lastPed = 0;
         if (curPed > 0 && s_lastPed > 0 && curPed != s_lastPed) {
             g_cfgState.bKillAroundAutoRepeat = false;
-            g_cfgState.bKillAroundAura = false;
-            g_SelectedId = 0;
-            g_AuraLast.clear();
-            g_kaHasActiveGhost = false;
-            g_KaClient = nullptr;
-            g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
+            g_cfgState.bKillAroundAura       = false;
+            g_SelectedId   = 0;
+            g_AuraOwned    = false;
+            g_AuraSkipUntil.clear();
+            g_GhostActive  = false;
+            g_KaClient     = nullptr;
+            g_ReliableTimeInst = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_Mtx);
+                g_Elems.clear();
+            }
+            g_BurstUntilMs.store(0, std::memory_order_release);
             g_LocalId.store(0, std::memory_order_release);
         }
         if (curPed > 0) s_lastPed = curPed;
@@ -1157,78 +1246,107 @@ inline void Tick() {
         }
     }
 
-    if (!g_cfgState.bKillAroundAutoRepeat && !g_cfgState.bKillAroundAura && !burstNow && !g_kaHasActiveGhost) {
+    if (!g_cfgState.bKillAroundAutoRepeat && !g_cfgState.bKillAroundAura && !burstNow && !g_GhostActive) {
         return;
     }
     if (!EnsureLocalIdCached()) return;
 
+    const int64_t now = MonoMs();
     Vec3 me{};
     if (!LocalPos(me)) return;
 
     const float radius = std::clamp(g_cfgState.killAroundRadius, 5.0f, 120.0f);
-    const bool aura = g_cfgState.bKillAroundAura || burstNow;
-    auto cands = Candidates(me, radius, tNow);
+    const bool burst   = now < g_BurstUntilMs.load(std::memory_order_acquire);
+    const bool aura    = g_cfgState.bKillAroundAura || burst;
+    auto cands         = Candidates(me, radius, now);
 
-    if (aura && !cands.empty() && (tNow - g_LastAuraMs) >= 60) {
-        g_LastAuraMs = tNow;
-        const size_t n = cands.size();
-        for (size_t step = 0; step < n; ++step) {
-            const size_t idx = (g_AuraCursor + step) % n;
-            const Candidate& c = cands[idx];
-            int64_t& last = g_AuraLast[c.id];
-            if (tNow - last < 250) continue;
-            if (c.dist > kMeleeReach) {
-                if (!g_cfgState.bKillAroundGhostStep) continue;
-                GhostTo(c.pos, me);
-            } else if (g_kaHasActiveGhost) {
-                GhostRestore(me);
+    // Rate limiter (exact kill_around (3).h): reset on accepted hit, pause 2s if >120 unacked sends
+    const int32_t accNow = g_AcceptedHits.load(std::memory_order_relaxed);
+    if (accNow != g_LastAccSeen) {
+        g_LastAccSeen = accNow;
+        g_UnackedSends = 0;
+    }
+    if (g_UnackedSends > 120) {
+        g_UnackedSends = 0;
+        g_AuraPauseUntilMs = now + 2000;
+    }
+    const bool paused = now < g_AuraPauseUntilMs;
+
+    // Kill-all: one target at a time through the same selection & burst path as manual KILL
+    if (aura) {
+        const bool selGone  = g_SelectedId < 1 || IsDeadNow(g_SelectedId, now);
+        const bool selStuck = g_AuraOwned && (now - g_AuraPickMs) > 3000;
+        if ((selGone || selStuck) && !cands.empty()) {
+            if (g_AuraOwned && g_SelectedId >= 1 && !IsDeadNow(g_SelectedId, now)) {
+                g_AuraSkipUntil[g_SelectedId] = now + 5000;
             }
-            Burst(c.id, c.gen, 6);
-            last = tNow;
-            g_AuraCursor = (idx + 1) % n;
-            break;
+            const Candidate* pick = nullptr;
+            for (const auto& c : cands) {
+                auto it = g_AuraSkipUntil.find(c.id);
+                if (it != g_AuraSkipUntil.end() && it->second > now) continue;
+                pick = &c;
+                break;
+            }
+            if (pick) {
+                g_SelectedId                     = pick->id;
+                g_CurTargetGen                   = pick->gen;
+                g_cfgState.bKillAroundAutoRepeat = true;
+                g_AuraOwned                      = true;
+                g_AuraPickMs                     = now;
+                g_LastFollowMs                   = 0;
+            }
         }
-    } else if (burstNow && cands.empty()) {
-        g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
+    } else if (g_AuraOwned) {
+        g_AuraOwned                      = false;
+        g_cfgState.bKillAroundAutoRepeat = false;
+        g_SelectedId                     = 0;
+    }
+    if (burst && cands.empty()) {
+        g_BurstUntilMs.store(0, std::memory_order_release);
     }
 
-    if (g_cfgState.bKillAroundAutoRepeat && g_SelectedId >= 1) {
-        if (IsDeadNow(g_SelectedId, tNow)) {
+    // Always keep ghost step enabled (exact kill_around (3).h)
+    g_cfgState.bKillAroundGhostStep = true;
+
+    if (g_cfgState.bKillAroundAutoRepeat && g_SelectedId >= 1 && !paused) {
+        if (IsDeadNow(g_SelectedId, now)) {
             g_cfgState.bKillAroundAutoRepeat = false;
-        } else if ((tNow - g_LastFollowMs) >= 250) {
-            g_LastFollowMs = tNow;
+        } else if ((now - g_LastFollowMs) >= 120) {
+            g_LastFollowMs = now;
             Vec3 tp{};
             if (ElemPos(g_SelectedId, tp)) {
                 g_CurTargetDist = std::sqrt((tp.x - me.x) * (tp.x - me.x) + (tp.z - me.z) * (tp.z - me.z));
                 const float dx = tp.x - me.x, dy = tp.y - me.y, dz = tp.z - me.z;
                 g_OutOfReach = std::sqrt(dx * dx + dy * dy + dz * dz) > kMeleeReach;
-                if (!aura) {
-                    if (!g_OutOfReach) {
-                        if (g_kaHasActiveGhost) GhostRestore(me);
-                        Burst(g_SelectedId, g_CurTargetGen, 6);
-                    } else if (g_cfgState.bKillAroundGhostStep) {
-                        GhostTo(tp, me);
-                        Burst(g_SelectedId, g_CurTargetGen, 6);
-                    }
+                if (!g_OutOfReach) {
+                    if (g_GhostActive) GhostRestore(me);
+                    Burst(g_SelectedId, g_CurTargetGen, 6);
+                } else {
+                    GhostTo(tp, me);
+                    Burst(g_SelectedId, g_CurTargetGen, 6);
                 }
             }
         }
     }
 
-    if (g_kaHasActiveGhost && tNow >= g_GhostHoldUntil && (!aura || cands.empty()) && !g_cfgState.bKillAroundAutoRepeat) {
+    if (g_GhostActive && now >= g_GhostHoldUntil && (!aura || cands.empty()) && !g_cfgState.bKillAroundAutoRepeat) {
         GhostRestore(me);
     }
 }
 
-// ---------------- Menu Panel (exact kill_around (2).h DrawSection) ----------------
+// ---------------- Menu Panel (exact kill_around (3).h DrawSection) ----------------
 inline void DrawPanel(float availW) {
     using Lang::T;
     g_cfgState.killAroundRadius = std::clamp(g_cfgState.killAroundRadius, 5.0f, 120.0f);
+    g_cfgState.bKillAroundGhostStep = true;
 
+    ImGui::TextColored(ImVec4(1.00f, 0.22f, 0.42f, 1.00f), "DEATH WISH");
+    ImGui::Separator();
     ThemeEngine::ProToggle(T("Auto-repeat kill selected target", "تكرار قتل الهدف المحدد تلقائياً"), &g_cfgState.bKillAroundAutoRepeat);
     ThemeEngine::ProToggle(T("One-hit on my swings while active", "ضربة قاضية بضرباتي أثناء التفعيل"), &g_cfgState.bKillAroundOneHit);
     ThemeEngine::ProSlider(T("Radius (m)", "مدى القتل (متر)"), &g_cfgState.killAroundRadius, 5.0f, 120.0f, "%.0f m");
-    ThemeEngine::ProToggle(T("Ghost step to far targets", "انتقال خفي للأهداف البعيدة"), &g_cfgState.bKillAroundGhostStep);
+    ImGui::TextColored(ImVec4(0.30f, 1.00f, 0.50f, 1.00f), "%s",
+                       T("Ghost step: always on (near and far)", "الانتقال الخفي: مفعّل دائماً (قريب وبعيد)"));
 
     const char* auraLbl = g_cfgState.bKillAroundAura
         ? T("KILL EVERYONE IN RANGE: ON  (tap to stop)##ka_btn", "قتل الجميع في المدى: مفعّل (اضغط للإيقاف)##ka_btn")
@@ -1236,12 +1354,12 @@ inline void DrawPanel(float availW) {
     if (ThemeEngine::NeonActionButton(auraLbl, std::max(160.0f, availW - 4.0f), 40.0f, g_cfgState.bKillAroundAura)) {
         g_cfgState.bKillAroundAura = !g_cfgState.bKillAroundAura;
         if (!g_cfgState.bKillAroundAura) {
-            g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
+            g_BurstUntilMs.store(0, std::memory_order_release);
         }
     }
 
     ImGui::Spacing();
-    const int64_t now = GetMonotonicMs();
+    const int64_t now = MonoMs();
     Vec3 me{};
     bool haveMe = false;
     {
@@ -1265,9 +1383,9 @@ inline void DrawPanel(float availW) {
                            Il2Cpp::IsUnityObjectSafe(g_metaClient.load(std::memory_order_relaxed));
     const int txMode = g_TxMode.load(std::memory_order_relaxed);
     const char* txTag = (txMode == 2) ? "Wire" : (txMode == 1 ? "Gen" : "-");
-    ImGui::TextDisabled("Net:%s | Sync:%s | Tx:%d/%d(%s) | Disp:%d",
+    ImGui::TextDisabled("Net:%s | Time:%s | Tx:%d/%d(%s) | Disp:%d",
                         hasClient ? "OK" : "Wait",
-                        g_LastRemoteTime.load(std::memory_order_relaxed) > 1000.0 ? "OK" : "0",
+                        (g_IncomingRemoteMs.load(std::memory_order_relaxed) != 0) ? "OK" : "0",
                         g_SendOk.load(std::memory_order_relaxed),
                         g_SendFail.load(std::memory_order_relaxed),
                         txTag,
@@ -1276,23 +1394,31 @@ inline void DrawPanel(float availW) {
     if (g_LocalId.load(std::memory_order_relaxed) < 1) {
         ImGui::TextColored(ImVec4(1.00f, 0.80f, 0.20f, 1.00f), "%s",
             T("Reading your element id from the game. Nothing sends until then.",
-              "جاري قراءة معرف اللاعب من اللعبة... انتظر لحظة."));
+              "جاري قراءة معرف اللاعب من اللعبة... لن يتم الإرسال حتى يظهر."));
     }
 
     for (const auto& c : all) {
         ImGui::PushID(c.id);
         std::string nm;
         const bool named = LookupName(c.id, &nm);
-        ImGui::Text("%s  #%d  [%.1fm]%s",
-                    named ? nm.c_str() : "Player",
-                    c.id, c.dist, c.dead ? " [DEAD]" : "");
+        const int32_t digi = DigiForElem(c.id);
+        if (digi > 0) {
+            ImGui::Text("%s  #%d (ID:%d)  [%.1fm]%s",
+                        named ? nm.c_str() : "Player",
+                        c.id, digi, c.dist, c.dead ? " [DEAD]" : "");
+        } else {
+            ImGui::Text("%s  #%d  [%.1fm]%s",
+                        named ? nm.c_str() : "Player",
+                        c.id, c.dist, c.dead ? " [DEAD]" : "");
+        }
         if (!c.dead) {
             ImGui::SameLine(std::max(180.0f, availW - 110.0f));
-            if (ImGui::Button(T("KILL##kab", "قتل##kab"), ImVec2(96.0f, 30.0f))) {
-                g_SelectedId = c.id;
-                g_CurTargetGen = c.gen;
+            if (ImGui::Button(T("KILL##kab", "قتل##kab"), ImVec2(96.0f, 32.0f))) {
+                g_SelectedId                     = c.id;
+                g_CurTargetGen                   = c.gen;
                 g_cfgState.bKillAroundAutoRepeat = true;
-                g_LastFollowMs = 0;
+                g_AuraOwned                      = false;
+                g_LastFollowMs                   = 0;
             }
         }
         ImGui::PopID();
@@ -1300,9 +1426,14 @@ inline void DrawPanel(float availW) {
 
     if (g_SelectedId > 0) {
         ImGui::Spacing();
-        ImGui::Text("%s: #%d  |  %s: %d",
-                    T("Selected", "المحدد"), g_SelectedId,
-                    T("Accepted hits", "الضربات المقبولة"), g_AcceptedHits.load(std::memory_order_relaxed));
+        std::string selNm;
+        const bool selNamed = LookupName(g_SelectedId, &selNm);
+        ImGui::Text("%s: %s #%d  |  %s: %d",
+                    T("Selected", "المحدد"),
+                    selNamed ? selNm.c_str() : "",
+                    g_SelectedId,
+                    T("Accepted hits", "الضربات المقبولة"),
+                    g_AcceptedHits.load(std::memory_order_relaxed));
         if (IsDeadNow(g_SelectedId, now)) {
             ImGui::TextColored(ImVec4(1.00f, 0.30f, 0.30f, 1.00f), "%s",
                                T("Selected target is dead", "الهدف المحدد مات"));
@@ -1315,11 +1446,12 @@ inline void DrawPanel(float availW) {
             ImGui::TextColored(ImVec4(0.30f, 1.00f, 0.50f, 1.00f), "%s",
                                T("Target in reach", "الهدف داخل المدى"));
         }
-        if (ThemeEngine::SecondaryPillButton(T("Stop##kastp", "إيقاف##kastp"), std::max(160.0f, availW - 4.0f), 32.0f, true)) {
+        if (ThemeEngine::SecondaryPillButton(T("Stop##kastp", "إيقاف##kastp"), std::max(160.0f, availW - 4.0f), 34.0f, true)) {
             g_cfgState.bKillAroundAutoRepeat = false;
-            g_cfgState.bKillAroundAura = false;
-            g_SelectedId = 0;
-            g_kaKillAllBurstUntilMs.store(0, std::memory_order_release);
+            g_cfgState.bKillAroundAura       = false;
+            g_SelectedId                     = 0;
+            g_AuraOwned                      = false;
+            g_BurstUntilMs.store(0, std::memory_order_release);
         }
     }
 }

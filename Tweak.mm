@@ -55,7 +55,10 @@ static OneStateGlassOverlay* g_overlay = nil;
 @end
 
 @interface ImGuiTouchSinkView : UIView
+@property (nonatomic, assign) CGRect bodyScrollRect;
+@property (nonatomic, assign, readonly) BOOL isBodyScrolling;
 - (void)flushToImGui;
+- (float)consumeScrollDeltaY;
 @end
 
 struct ImGuiQueuedTouchEvt {
@@ -67,9 +70,24 @@ struct ImGuiQueuedTouchEvt {
 @implementation ImGuiTouchSinkView {
     ImGuiQueuedTouchEvt _queue[128];
     int     _queueCount;
+    CGPoint _startPos;
     CGPoint _lastPos;
     __weak UITouch* _activeTouch;
+    BOOL    _inBodyTouch;
+    BOOL    _isBodyScrolling;
+    BOOL    _isSliderDrag;
+    BOOL    _pendingTapUp;
+    CGPoint _pendingTapPos;
     int     _clearPosFrames;
+    float   _scrollDeltaY;
+}
+- (BOOL)isBodyScrolling {
+    return _isBodyScrolling;
+}
+- (float)consumeScrollDeltaY {
+    float d = _scrollDeltaY;
+    _scrollDeltaY = 0.0f;
+    return d;
 }
 - (void)pushEvt:(int)type x:(float)x y:(float)y {
     if (_queueCount < 128) {
@@ -91,6 +109,12 @@ struct ImGuiQueuedTouchEvt {
             }
         }
         _queueCount = 0;
+    } else if (_pendingTapUp) {
+        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+        io.AddMousePosEvent((float)_pendingTapPos.x, (float)_pendingTapPos.y);
+        io.AddMouseButtonEvent(0, false);
+        _pendingTapUp = NO;
+        _clearPosFrames = 2;
     } else if (_clearPosFrames > 0) {
         --_clearPosFrames;
         if (_clearPosFrames == 0 && _activeTouch == nil) {
@@ -101,32 +125,107 @@ struct ImGuiQueuedTouchEvt {
 - (void)touchesBegan:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
+    if (_pendingTapUp) {
+        [self pushEvt:0 x:(float)_pendingTapPos.x y:(float)_pendingTapPos.y];
+        [self pushEvt:2 x:(float)_pendingTapPos.x y:(float)_pendingTapPos.y];
+        _pendingTapUp = NO;
+    }
     _activeTouch = touch;
     _clearPosFrames = 0;
     CGPoint p = [touch locationInView:self];
+    _startPos = p;
     _lastPos = p;
-    [self pushEvt:0 x:(float)p.x y:(float)p.y];
-    [self pushEvt:1 x:(float)p.x y:(float)p.y];
+    if (!CGRectIsEmpty(_bodyScrollRect) && CGRectContainsPoint(_bodyScrollRect, p)) {
+        // Hold touch inside scrollable feature list: vertical drags scroll cleanly with ZERO accidental clicks/toggles
+        _inBodyTouch = YES;
+        _isBodyScrolling = NO;
+        _isSliderDrag = NO;
+    } else {
+        _inBodyTouch = NO;
+        _isBodyScrolling = NO;
+        _isSliderDrag = NO;
+        [self pushEvt:0 x:(float)p.x y:(float)p.y];
+        [self pushEvt:1 x:(float)p.x y:(float)p.y];
+    }
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
-    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : t.anyObject;
+    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : nil;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
-    if (std::fabs((double)(p.x - _lastPos.x)) > 0.2 || std::fabs((double)(p.y - _lastPos.y)) > 0.2) {
+    if (_inBodyTouch) {
+        double totalDx = (double)(p.x - _startPos.x);
+        double totalDy = (double)(p.y - _startPos.y);
+        double stepDy  = (double)(p.y - _lastPos.y);
         _lastPos = p;
-        [self pushEvt:0 x:(float)p.x y:(float)p.y];
+        if (!_isBodyScrolling && !_isSliderDrag) {
+            if (std::fabs(totalDy) >= 7.0 && std::fabs(totalDy) >= std::fabs(totalDx)) {
+                _isBodyScrolling = YES;
+                _scrollDeltaY += -(float)totalDy;
+                [self pushEvt:0 x:-FLT_MAX y:-FLT_MAX];
+            } else if (std::fabs(totalDx) >= 8.0 && std::fabs(totalDx) > std::fabs(totalDy)) {
+                _isSliderDrag = YES;
+                [self pushEvt:0 x:(float)_startPos.x y:(float)_startPos.y];
+                [self pushEvt:1 x:(float)_startPos.x y:(float)_startPos.y];
+                [self pushEvt:0 x:(float)p.x y:(float)p.y];
+            }
+        } else if (_isBodyScrolling) {
+            _scrollDeltaY += -(float)stepDy;
+        } else if (_isSliderDrag) {
+            [self pushEvt:0 x:(float)p.x y:(float)p.y];
+        }
+    } else {
+        if (std::fabs((double)(p.x - _lastPos.x)) > 0.2 || std::fabs((double)(p.y - _lastPos.y)) > 0.2) {
+            _lastPos = p;
+            [self pushEvt:0 x:(float)p.x y:(float)p.y];
+        }
     }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
-    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : t.anyObject;
-    CGPoint p = touch ? [touch locationInView:self] : _lastPos;
+    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : nil;
+    if (!touch) return;
+    CGPoint p = [touch locationInView:self];
+    if (_inBodyTouch) {
+        if (_isBodyScrolling) {
+            // Scroll finished — zero touch/click emitted to ImGui
+            _isBodyScrolling = NO;
+            _inBodyTouch = NO;
+            _activeTouch = nil;
+            return;
+        }
+        if (_isSliderDrag) {
+            [self pushEvt:0 x:(float)p.x y:(float)p.y];
+            [self pushEvt:2 x:(float)p.x y:(float)p.y];
+            _isSliderDrag = NO;
+            _inBodyTouch = NO;
+            _activeTouch = nil;
+            _clearPosFrames = 2;
+            return;
+        }
+        // Genuine stationary tap: emit Down on this frame and Up on the next frame for 100% reliable ImGui clicks
+        [self pushEvt:0 x:(float)p.x y:(float)p.y];
+        [self pushEvt:1 x:(float)p.x y:(float)p.y];
+        _pendingTapUp = YES;
+        _pendingTapPos = p;
+        _inBodyTouch = NO;
+        _activeTouch = nil;
+        return;
+    }
     [self pushEvt:0 x:(float)p.x y:(float)p.y];
     [self pushEvt:2 x:(float)p.x y:(float)p.y];
     _activeTouch = nil;
     _clearPosFrames = 2;
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
+    if (_inBodyTouch && !_isSliderDrag) {
+        _inBodyTouch = NO;
+        _isBodyScrolling = NO;
+        _activeTouch = nil;
+        return;
+    }
     [self pushEvt:2 x:(float)_lastPos.x y:(float)_lastPos.y];
+    _inBodyTouch = NO;
+    _isBodyScrolling = NO;
+    _isSliderDrag = NO;
     _activeTouch = nil;
     _clearPosFrames = 2;
 }
@@ -419,7 +518,7 @@ struct ImGuiQueuedTouchEvt {
         (g_cfgState.bFlyHack || g_cfgState.bCarFly || g_cfgState.bFreeCam || g_cfgState.bSpectateActive ||
          g_cfgState.bCarHack || g_cfgState.bAutoRepair || g_cfgState.bAutoMapMarkerTp || Features::g_mapTpLanding.active ||
          g_cfgState.bSilentWallbang || g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-         KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 || KillAround::g_kaHasActiveGhost ||
+         KillAround::g_BurstUntilMs.load(std::memory_order_relaxed) > 0 || KillAround::g_GhostActive ||
          g_cfgState.bSuperJump || g_cfgState.bSuperPunch || g_cfgState.bSpeedHack || g_cfgState.bInfStamina ||
          g_cfgState.bAutoHeal || g_cfgState.bAutoVest || g_cfgState.bZoneGuard || g_cfgState.bGreenZoneBypass ||
          g_cfgState.bInstantReload || g_cfgState.bNoRecoil || g_cfgState.bRapidFire || g_cfgState.bScaleEnable ||
@@ -480,12 +579,19 @@ struct ImGuiQueuedTouchEvt {
 
     if (isAuthed && AuthSystem::IsVerifiedFast()) {
         Features::DrawOverlayVisuals(ImGui::GetBackgroundDrawList(), (float)pts.width, (float)pts.height);
-        if (self.menuOpen) [self renderProDeckWithWidth:(float)pts.width height:(float)pts.height];
+        if (self.menuOpen) {
+            [self renderProDeckWithWidth:(float)pts.width height:(float)pts.height];
+        } else if (self.touchSink) {
+            self.touchSink.bodyScrollRect = CGRectZero;
+        }
     } else if (self.menuOpen) {
+        if (self.touchSink) self.touchSink.bodyScrollRect = CGRectZero;
         if (AuthSystem::DrawLoginDeck((float)pts.width, (float)pts.height,
                                       g_cfgState.languageMode, self.overlayWindow.rootViewController)) {
             self.menuOpen = NO;
         }
+    } else if (self.touchSink) {
+        self.touchSink.bodyScrollRect = CGRectZero;
     }
 
     ImGui::Render();
@@ -675,13 +781,17 @@ struct ImGuiQueuedTouchEvt {
         [self drawSubTabBar:subs count:2 active:curSub barWidth:barW];
     }
 
-    // Main Scrollable Body below Sub-Tab Bar (driven exclusively by the right-side Up/Down Scrollbar Rail!)
+    // Main Scrollable Body below Sub-Tab Bar (touch-safe vertical scroll + right-side Up/Down Scrollbar Rail)
     float bodyH = winH - 74.0f;
-    const float scrollRailW = 34.0f;
+    const float scrollRailW = 38.0f;
     const float scrollRailGap = 8.0f;
     const bool isEspPreviewSub = (self.activeTab == 1 && curSub == 0);
     const float espPreviewW = isEspPreviewSub ? std::min(210.0f, (contentW - scrollRailW - scrollRailGap) * 0.40f) : 0.0f;
     const float bodyW = contentW - scrollRailW - scrollRailGap - (isEspPreviewSub ? (espPreviewW + 12.0f) : 0.0f);
+
+    if (self.touchSink) {
+        self.touchSink.bodyScrollRect = CGRectMake(contentX, wp.y + 62.0f, bodyW, bodyH);
+    }
 
     if (_lastScrollTab != self.activeTab || _lastScrollSub != curSub) {
         _lastScrollTab = self.activeTab;
@@ -691,9 +801,16 @@ struct ImGuiQueuedTouchEvt {
 
     ImGui::SetCursorScreenPos(ImVec2(contentX, wp.y + 62.0f));
     ImGui::BeginChild("##MainBody", ImVec2(bodyW, bodyH), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    float bodyMaxSy = ImGui::GetScrollMaxY();
     if (_pendingScrollY >= 0.0f) {
-        ImGui::SetScrollY(_pendingScrollY);
+        ImGui::SetScrollY(std::clamp(_pendingScrollY, 0.0f, bodyMaxSy));
         _pendingScrollY = -1.0f;
+    }
+    if (self.touchSink) {
+        float dragDy = [self.touchSink consumeScrollDeltaY];
+        if (std::fabs(dragDy) > 0.01f && bodyMaxSy > 0.5f) {
+            ImGui::SetScrollY(std::clamp(ImGui::GetScrollY() + dragDy, 0.0f, bodyMaxSy));
+        }
     }
 
     // ========================================================================
