@@ -421,7 +421,7 @@ struct RuntimeSettings {
     bool bKillAroundIncludeVehicles= true;
     bool bKillAroundOneHit         = true;
     bool bKillAroundFilterNear     = false;
-    float killAroundRadius         = 65.0f;
+    float killAroundRadius         = 120.0f;
     bool bNickBypass         = false;
     bool bVoiceGuard         = false;
     bool bDeviceIdSpoof      = false;
@@ -816,12 +816,11 @@ inline bool SwapVirtualMethod(const char* nsName, const char* clsName, const cha
     if (outOrig) *outOrig = orig;
 
     bool patchedMethod = SafeMem::Write(methodInfo, &replacement, sizeof(void*));
-    bool isValType = (g_api.class_is_valuetype && g_api.class_is_valuetype(klass));
     uint8_t* kBase = reinterpret_cast<uint8_t*>(klass);
     for (size_t off = 0x100; off < 0x3800; off += sizeof(void*)) {
         void* pair[2]{};
         if (!SafeMem::Read(kBase + off, pair, sizeof(pair))) break;
-        if (pair[1] == methodInfo && (pair[0] == orig || isValType)) {
+        if (pair[0] == orig && pair[1] == methodInfo) {
             SafeMem::Write(kBase + off, &replacement, sizeof(void*));
         }
     }

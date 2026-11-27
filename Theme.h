@@ -769,4 +769,103 @@ inline void RenderInteractivePreview(const PreviewConfig& cfg, int& previewPose)
     }
 }
 
+// Dedicated iPhone Vertical Scrollbar Rail: [Up] + Wide Draggable Track/Thumb + [Down]
+inline bool DrawTouchScrollRail(const char* id, ImVec2 pos, float railW, float railH, float curScrollY, float maxScrollY, float& outNewScrollY) {
+    ImGui::PushID(id);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    bool changed = false;
+    outNewScrollY = curScrollY;
+
+    const float btnH   = 32.0f;
+    const float gap    = 5.0f;
+    const float trackY = pos.y + btnH + gap;
+    const float trackH = std::max(40.0f, railH - (btnH + gap) * 2.0f);
+    const float downY  = trackY + trackH + gap;
+    const bool  canScroll = (maxScrollY > 1.0f);
+    const float stepPx = std::max(36.0f, railH * 0.16f);
+
+    // 1. Up Button [▲]
+    ImGui::SetCursorScreenPos(pos);
+    bool upClick = ImGui::InvisibleButton("##sc_up", ImVec2(railW, btnH));
+    bool upHeld  = ImGui::IsItemActive();
+    dl->AddRectFilled(pos, ImVec2(pos.x + railW, pos.y + btnH),
+                      upHeld ? GetAccent(0.85f) : IM_COL32(36, 40, 54, 240), 9.0f);
+    dl->AddRect(pos, ImVec2(pos.x + railW, pos.y + btnH), IM_COL32(255, 255, 255, 28), 9.0f, 0, 1.0f);
+    {
+        float cx = pos.x + railW * 0.5f, cy = pos.y + btnH * 0.5f;
+        ImU32 ic = canScroll ? IM_COL32(255, 255, 255, 245) : IM_COL32(130, 138, 158, 120);
+        dl->AddTriangleFilled(ImVec2(cx, cy - 5.5f), ImVec2(cx - 6.5f, cy + 4.5f), ImVec2(cx + 6.5f, cy + 4.5f), ic);
+    }
+    if (canScroll && (upClick || (upHeld && ImGui::GetIO().MouseDownDuration[0] > 0.18f))) {
+        float delta = upClick ? stepPx : (stepPx * 0.22f);
+        outNewScrollY = std::clamp(curScrollY - delta, 0.0f, maxScrollY);
+        changed = true;
+    }
+
+    // 2. Wide Finger-Draggable Scrollbar Track + High-Contrast Thumb
+    ImVec2 trkA(pos.x, trackY);
+    ImVec2 trkB(pos.x + railW, trackY + trackH);
+    ImGui::SetCursorScreenPos(trkA);
+    ImGui::InvisibleButton("##sc_trk", ImVec2(railW, trackH));
+    bool trkHeld = ImGui::IsItemActive();
+    bool trkHov  = ImGui::IsItemHovered();
+
+    dl->AddRectFilled(trkA, trkB, IM_COL32(24, 28, 38, 225), railW * 0.45f);
+    dl->AddRect(trkA, trkB, IM_COL32(255, 255, 255, 24), railW * 0.45f, 0, 1.0f);
+
+    float visibleRatio = canScroll ? std::clamp(railH / (railH + maxScrollY), 0.16f, 0.92f) : 1.0f;
+    float thumbH = canScroll ? std::max(44.0f, trackH * visibleRatio) : (trackH - 6.0f);
+    float travel = std::max(1.0f, trackH - thumbH);
+
+    if (canScroll && trkHeld) {
+        g_sliderDragging = true;
+        float my = ImGui::GetIO().MousePos.y;
+        float frac = std::clamp((my - trackY - thumbH * 0.5f) / travel, 0.0f, 1.0f);
+        outNewScrollY = frac * maxScrollY;
+        changed = true;
+    }
+
+    float norm = canScroll ? std::clamp(outNewScrollY / maxScrollY, 0.0f, 1.0f) : 0.0f;
+    float thumbY = trackY + (canScroll ? (norm * travel) : 3.0f);
+    ImVec2 thA(pos.x + 3.0f, thumbY);
+    ImVec2 thB(pos.x + railW - 3.0f, thumbY + thumbH);
+    ImU32 thCol = !canScroll
+        ? IM_COL32(90, 98, 118, 85)
+        : (trkHeld ? GetAccent(1.0f) : (trkHov ? GetAccent(0.90f) : GetAccent(0.78f)));
+    dl->AddRectFilled(thA, thB, thCol, (railW - 6.0f) * 0.45f);
+    dl->AddRect(thA, thB, IM_COL32(255, 255, 255, canScroll ? 90 : 25), (railW - 6.0f) * 0.45f, 0, 1.0f);
+
+    // Tactile 3-bar grip indicator inside thumb
+    if (thumbH >= 28.0f) {
+        float gcx = pos.x + railW * 0.5f;
+        float gcy = thumbY + thumbH * 0.5f;
+        ImU32 gc  = IM_COL32(255, 255, 255, canScroll ? 210 : 75);
+        dl->AddLine(ImVec2(gcx - 5.5f, gcy - 4.0f), ImVec2(gcx + 5.5f, gcy - 4.0f), gc, 1.5f);
+        dl->AddLine(ImVec2(gcx - 5.5f, gcy),        ImVec2(gcx + 5.5f, gcy),        gc, 1.5f);
+        dl->AddLine(ImVec2(gcx - 5.5f, gcy + 4.0f), ImVec2(gcx + 5.5f, gcy + 4.0f), gc, 1.5f);
+    }
+
+    // 3. Down Button [▼]
+    ImVec2 dnA(pos.x, downY);
+    ImGui::SetCursorScreenPos(dnA);
+    bool dnClick = ImGui::InvisibleButton("##sc_dn", ImVec2(railW, btnH));
+    bool dnHeld  = ImGui::IsItemActive();
+    dl->AddRectFilled(dnA, ImVec2(dnA.x + railW, dnA.y + btnH),
+                      dnHeld ? GetAccent(0.85f) : IM_COL32(36, 40, 54, 240), 9.0f);
+    dl->AddRect(dnA, ImVec2(dnA.x + railW, dnA.y + btnH), IM_COL32(255, 255, 255, 28), 9.0f, 0, 1.0f);
+    {
+        float cx = dnA.x + railW * 0.5f, cy = dnA.y + btnH * 0.5f;
+        ImU32 ic = canScroll ? IM_COL32(255, 255, 255, 245) : IM_COL32(130, 138, 158, 120);
+        dl->AddTriangleFilled(ImVec2(cx, cy + 5.5f), ImVec2(cx - 6.5f, cy - 4.5f), ImVec2(cx + 6.5f, cy - 4.5f), ic);
+    }
+    if (canScroll && (dnClick || (dnHeld && ImGui::GetIO().MouseDownDuration[0] > 0.18f))) {
+        float delta = dnClick ? stepPx : (stepPx * 0.22f);
+        outNewScrollY = std::clamp(curScrollY + delta, 0.0f, maxScrollY);
+        changed = true;
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
 } // namespace ThemeEngine

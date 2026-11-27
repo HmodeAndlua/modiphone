@@ -6,6 +6,7 @@
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 
@@ -57,69 +58,77 @@ static OneStateGlassOverlay* g_overlay = nil;
 - (void)flushToImGui;
 @end
 
+struct ImGuiQueuedTouchEvt {
+    int   type; // 0 = Pos, 1 = Down, 2 = Up
+    float x;
+    float y;
+};
+
 @implementation ImGuiTouchSinkView {
-    CGPoint _touchPos;
-    BOOL    _hasTouchPos;
-    BOOL    _touchDown;
-    BOOL    _latchedDown;
-    BOOL    _latchedUp;
+    ImGuiQueuedTouchEvt _queue[128];
+    int     _queueCount;
+    CGPoint _lastPos;
+}
+- (void)pushEvt:(int)type x:(float)x y:(float)y {
+    if (_queueCount < 128) {
+        _queue[_queueCount++] = { type, x, y };
+    }
 }
 - (void)flushToImGui {
+    if (_queueCount <= 0) return;
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    if (_hasTouchPos) {
-        io.AddMousePosEvent((float)_touchPos.x, (float)_touchPos.y);
+    for (int i = 0; i < _queueCount; ++i) {
+        const ImGuiQueuedTouchEvt& ev = _queue[i];
+        if (ev.type == 0) {
+            io.AddMousePosEvent(ev.x, ev.y);
+        } else if (ev.type == 1) {
+            io.AddMouseButtonEvent(0, true);
+        } else if (ev.type == 2) {
+            io.AddMouseButtonEvent(0, false);
+        }
     }
-
-    if (_latchedDown) {
-        io.AddMouseButtonEvent(0, true);
-        _latchedDown = NO;
-    } else if (_latchedUp) {
-        io.AddMouseButtonEvent(0, false);
-        _latchedUp = NO;
-    } else {
-        io.AddMouseButtonEvent(0, _touchDown ? true : false);
-    }
+    _queueCount = 0;
 }
 - (void)touchesBegan:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
-    _touchPos = p;
-    _hasTouchPos = YES;
-    _touchDown = YES;
-    _latchedDown = YES;
-    _latchedUp = NO;
+    _lastPos = p;
+    [self pushEvt:0 x:(float)p.x y:(float)p.y];
+    [self pushEvt:1 x:(float)p.x y:(float)p.y];
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
-    _touchPos = p;
-    _hasTouchPos = YES;
-    _touchDown = YES;
+    if (std::fabs((double)(p.x - _lastPos.x)) > 0.2 || std::fabs((double)(p.y - _lastPos.y)) > 0.2) {
+        _lastPos = p;
+        [self pushEvt:0 x:(float)p.x y:(float)p.y];
+    }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
-    if (touch) {
-        _touchPos = [touch locationInView:self];
-        _hasTouchPos = YES;
-    }
-    _touchDown = NO;
-    _latchedUp = YES;
+    CGPoint p = touch ? [touch locationInView:self] : _lastPos;
+    [self pushEvt:0 x:(float)p.x y:(float)p.y];
+    [self pushEvt:2 x:(float)p.x y:(float)p.y];
+    [self pushEvt:0 x:-FLT_MAX y:-FLT_MAX];
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
-    _touchDown = NO;
-    _latchedUp = YES;
+    [self pushEvt:2 x:(float)_lastPos.x y:(float)_lastPos.y];
+    [self pushEvt:0 x:-FLT_MAX y:-FLT_MAX];
 }
 @end
 
 @implementation OneStateGlassOverlay {
-    char _searchBuf[64];
-    char _playerSearchBuf[64];
-    char _freeCamSearchBuf[64];
-    int  _subTabs[5];
-    BOOL _overlayWasDrawn;
+    char  _searchBuf[64];
+    char  _playerSearchBuf[64];
+    char  _freeCamSearchBuf[64];
+    int   _subTabs[5];
+    int   _lastScrollTab;
+    int   _lastScrollSub;
+    float _pendingScrollY;
+    BOOL  _overlayWasDrawn;
 }
 
 - (instancetype)init {
@@ -127,6 +136,9 @@ static OneStateGlassOverlay* g_overlay = nil;
         _menuOpen = NO;
         _activeTab = 1; // Default to Visuals -> Player + Interactive Preview (matches reference)
         for (int i = 0; i < 5; ++i) _subTabs[i] = 0;
+        _lastScrollTab = -1;
+        _lastScrollSub = -1;
+        _pendingScrollY = -1.0f;
         _wardrobeSubTab = 0;
         _previewPose = 0;
         _searchBuf[0] = '\0';
@@ -395,7 +407,7 @@ static OneStateGlassOverlay* g_overlay = nil;
         (g_cfgState.bFlyHack || g_cfgState.bCarFly || g_cfgState.bFreeCam || g_cfgState.bSpectateActive ||
          g_cfgState.bCarHack || g_cfgState.bAutoRepair || g_cfgState.bAutoMapMarkerTp || Features::g_mapTpLanding.active ||
          g_cfgState.bSilentWallbang || g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-         KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 ||
+         KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 || KillAround::g_kaHasActiveGhost ||
          g_cfgState.bSuperJump || g_cfgState.bSuperPunch || g_cfgState.bSpeedHack || g_cfgState.bInfStamina ||
          g_cfgState.bAutoHeal || g_cfgState.bAutoVest || g_cfgState.bZoneGuard || g_cfgState.bGreenZoneBypass ||
          g_cfgState.bInstantReload || g_cfgState.bNoRecoil || g_cfgState.bRapidFire || g_cfgState.bScaleEnable ||
@@ -565,7 +577,7 @@ static OneStateGlassOverlay* g_overlay = nil;
     ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImVec2((w - winW) * 0.5f, (h - winH) * 0.5f), ImGuiCond_FirstUseEver);
 
-    ImGuiWindowFlags wf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar;
+    ImGuiWindowFlags wf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove;
     if (!ImGui::Begin("##ProDeck", nullptr, wf)) { ImGui::End(); return; }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -651,17 +663,32 @@ static OneStateGlassOverlay* g_overlay = nil;
         [self drawSubTabBar:subs count:2 active:curSub barWidth:barW];
     }
 
-    // Main Scrollable Body below Sub-Tab Bar
+    // Main Scrollable Body below Sub-Tab Bar (driven exclusively by the right-side Up/Down Scrollbar Rail!)
     float bodyH = winH - 74.0f;
+    const float scrollRailW = 34.0f;
+    const float scrollRailGap = 8.0f;
+    const bool isEspPreviewSub = (self.activeTab == 1 && curSub == 0);
+    const float espPreviewW = isEspPreviewSub ? std::min(210.0f, (contentW - scrollRailW - scrollRailGap) * 0.40f) : 0.0f;
+    const float bodyW = contentW - scrollRailW - scrollRailGap - (isEspPreviewSub ? (espPreviewW + 12.0f) : 0.0f);
+
+    if (_lastScrollTab != self.activeTab || _lastScrollSub != curSub) {
+        _lastScrollTab = self.activeTab;
+        _lastScrollSub = curSub;
+        _pendingScrollY = 0.0f;
+    }
+
     ImGui::SetCursorScreenPos(ImVec2(contentX, wp.y + 62.0f));
-    ImGui::BeginChild("##MainBody", ImVec2(contentW, bodyH), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    ImGui::BeginChild("##MainBody", ImVec2(bodyW, bodyH), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (_pendingScrollY >= 0.0f) {
+        ImGui::SetScrollY(_pendingScrollY);
+        _pendingScrollY = -1.0f;
+    }
 
     // ========================================================================
     // TAB 0: COMBAT (Crosshair Icon)
     // ========================================================================
     if (self.activeTab == 0) {
         if (curSub == 0) {
-            ImGui::BeginChild("##cbt_l", ImVec2(contentW * 0.49f, 0), false);
             ThemeEngine::ProToggle(T("Enable Aimbot", "تفعيل الأيم بوت"), &g_cfgState.bEnableAimbot);
             ThemeEngine::ProToggle(T("Silent Aim (HWBP)", "سايلنت إيم (HWBP)"), &g_cfgState.bSilentAim);
             ThemeEngine::ProToggle(T("Bullet Wallbang", "اختراق الجدران للرصاص"), &g_cfgState.bSilentWallbang);
@@ -672,15 +699,11 @@ static OneStateGlassOverlay* g_overlay = nil;
             ThemeEngine::ProToggle(T("Velocity Prediction", "توقع حركة الهدف"), &g_cfgState.bPrediction);
             ThemeEngine::ProCombo(T("Target Bone", "عظمة التصويب"), &g_cfgState.aimBoneMode,
                                   TCombo("Head\0Body\0", "الرأس\0الجسم\0"));
-            ImGui::EndChild();
-            ImGui::SameLine(0, 16.0f);
-            ImGui::BeginChild("##cbt_r", ImVec2(0, 0), false);
             ThemeEngine::ProSlider(T("FOV Radius", "حجم الدائرة"), &g_cfgState.aimFov, 40.0f, 800.0f, "%.0f px");
             ThemeEngine::ProSlider(T("Silent Aim Range", "مدى السايلنت إيم"), &g_cfgState.saRadius, 30.0f, 400.0f, "%.0f m");
             ThemeEngine::ProSlider(T("Smoothing", "نعومة الأيم"), &g_cfgState.aimSmoothing, 0.05f, 1.0f, "%.2f");
             ThemeEngine::ProSlider(T("Bullet Speed", "سرعة الرصاصة"), &g_cfgState.bulletSpeed, 100.0f, 2000.0f, "%.0f");
             ThemeEngine::ProSlider(T("Prediction", "معامل التوقع"), &g_cfgState.predictionFactor, 0.0f, 5.0f, "%.2f");
-            ImGui::EndChild();
         } else if (curSub == 1) {
             ThemeEngine::ProToggle(T("Instant Reload", "تعمير فوري"), &g_cfgState.bInstantReload);
             ThemeEngine::ProToggle(T("No Recoil", "ثبات السلاح"), &g_cfgState.bNoRecoil);
@@ -710,7 +733,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                 }
             }
         } else {
-            KillAround::DrawPanel(contentW);
+            KillAround::DrawPanel(bodyW);
         }
     }
     // ========================================================================
@@ -718,8 +741,6 @@ static OneStateGlassOverlay* g_overlay = nil;
     // ========================================================================
     else if (self.activeTab == 1) {
         if (curSub == 0) {
-            float leftW = contentW * 0.56f;
-            ImGui::BeginChild("##vis_ctrl", ImVec2(leftW, 0), false);
             ThemeEngine::ProToggle(T("Enable Player ESP", "تفعيل كشف اللاعبين ESP"), &g_cfgState.bEnableESP);
             ThemeEngine::ProToggle(T("Bounding Box", "مربع حول اللاعب"), &g_cfgState.bEspBox, g_cfgState.espBoxCol);
             ThemeEngine::ProCombo(T("Box Style", "شكل المربع"), &g_cfgState.espBoxStyle,
@@ -738,27 +759,6 @@ static OneStateGlassOverlay* g_overlay = nil;
             ThemeEngine::ProToggle(T("MiniMap Radar", "رادار مصغر"), &g_cfgState.bMiniMapEsp);
             ThemeEngine::ProToggle(T("Include Street NPCs", "إظهار البوتات"), &g_cfgState.bShowNpcs);
             ThemeEngine::ProSlider(T("ESP Radius", "مدى الكشف"), &g_cfgState.espRadiusValue, 25.0f, 500.0f, "%.0f m");
-            ImGui::EndChild();
-
-            ImGui::SameLine(0, 14.0f);
-            ImGui::BeginChild("##vis_prev", ImVec2(0, 0), false);
-            ThemeEngine::PreviewConfig pc{};
-            pc.box      = g_cfgState.bEspBox;
-            pc.boxStyle = g_cfgState.espBoxStyle;
-            pc.health   = g_cfgState.bEspHealth;
-            pc.armor    = g_cfgState.bEspArmor;
-            pc.name     = g_cfgState.bEspName;
-            pc.playerId = g_cfgState.bEspPlayerId;
-            pc.skeleton = g_cfgState.bSkeletonESP;
-            pc.weapon   = g_cfgState.bEspWeapon;
-            pc.distance = g_cfgState.bEspDistance;
-            pc.snapline = g_cfgState.bEspLine;
-            pc.lineOrigin = g_cfgState.lineOrigin;
-            pc.boxCol   = IM_COL32((int)(g_cfgState.espBoxCol[0] * 255), (int)(g_cfgState.espBoxCol[1] * 255), (int)(g_cfgState.espBoxCol[2] * 255), 255);
-            int pose = self.previewPose;
-            ThemeEngine::RenderInteractivePreview(pc, pose);
-            self.previewPose = pose;
-            ImGui::EndChild();
         } else if (curSub == 1) {
             // Dedicated FreeCam & All-Server Spectate + Ghost Proxy Underground Voice Sub-Tab
             ThemeEngine::ProToggle(T("Enable FreeCam (Free-Fly)", "تفعيل الكاميرا الحرة (فري كام)"), &g_cfgState.bFreeCam);
@@ -827,7 +827,6 @@ static OneStateGlassOverlay* g_overlay = nil;
                 ImGui::TextDisabled("%s", T("Scanning server players... join world first.",
                                             "جاري مسح لاعبي السيرفر... ادخل العالم أولاً."));
             } else {
-                ImGui::BeginChild("##spec_list", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 int matchCount = 0;
                 for (const auto& sp : serverList) {
                     char idStr[32];
@@ -856,7 +855,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                     ImGui::TextColored(rowCol, "%s [#%u] [%s]", sp.name.c_str(), shownId, distTag);
 
                     float btnArea = sp.isStreamed ? 182.0f : 124.0f;
-                    ImGui::SameLine(std::max(220.0f, contentW - btnArea));
+                    ImGui::SameLine(std::max(180.0f, bodyW - btnArea));
                     if (sp.pedEntityVal > 0) {
                         if (ImGui::Button(T("Spectate##sp", "مراقبة##sp"), ImVec2(114.0f, 26.0f))) {
                             Features::StartSpectatePlayer(sp.pedEntityVal, sp.name);
@@ -873,7 +872,6 @@ static OneStateGlassOverlay* g_overlay = nil;
                 if (matchCount == 0) {
                     ImGui::TextDisabled("%s", T("No matching player found.", "لم يتم العثور على لاعب مطابق."));
                 }
-                ImGui::EndChild();
             }
         } else if (curSub == 2) {
             ThemeEngine::ProToggle(T("Enable Spray ESP", "كشف البخاخات"), &g_cfgState.bSprayESP, g_cfgState.sprayEspCol);
@@ -935,7 +933,7 @@ static OneStateGlassOverlay* g_overlay = nil;
             ThemeEngine::ProSlider(T("Speed Scale", "مضاعف السرعة"), &g_cfgState.speedMultiplier, 0.5f, 8.0f, "x%.1f");
         } else if (curSub == 1) {
             // Dedicated Map Marker / Waypoint Teleport Sub-Tab (Solo + Inside Vehicle Together)
-            float tpBtnW = std::max(140.0f, contentW - 134.0f);
+            float tpBtnW = std::max(130.0f, bodyW - 128.0f);
             if (ThemeEngine::NeonActionButton(T("Teleport to Map Marker (Solo / Car)##tpbtn", "الانتقال لعلامة الخريطة (فردي / بالسيارة)##tpbtn"), tpBtnW, 38.0f, false)) {
                 Features::TeleportToNearestUserMapPin();
             }
@@ -1150,7 +1148,6 @@ static OneStateGlassOverlay* g_overlay = nil;
                 ImGui::TextDisabled("%s", T("Scanning server players... join world to populate list.",
                                             "جاري مسح لاعبي السيرفر... ادخل العالم لتحديث القائمة."));
             } else {
-                ImGui::BeginChild("##pl_scroll", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 for (const auto& sp : serverList) {
                     if (_playerSearchBuf[0] != '\0') {
                         char idStr[32];
@@ -1168,7 +1165,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                     } else {
                         ImGui::TextColored(col, "%s [#%lld] [FAR]", sp.name.c_str(), (long long)pidVal);
                     }
-                    ImGui::SameLine(std::max(210.0f, contentW - 236.0f));
+                    ImGui::SameLine(std::max(185.0f, bodyW - 236.0f));
                     if (sp.pedEntityVal > 0 && ImGui::Button(T("Spec##plsp", "مراقبة##plsp"), ImVec2(64.0f, 25.0f))) {
                         Features::StartSpectatePlayer(sp.pedEntityVal, sp.name);
                     }
@@ -1190,7 +1187,6 @@ static OneStateGlassOverlay* g_overlay = nil;
                     }
                     ImGui::PopID();
                 }
-                ImGui::EndChild();
             }
         }
     }
@@ -1255,7 +1251,41 @@ static OneStateGlassOverlay* g_overlay = nil;
     }
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    float curScrollY = ImGui::GetScrollY();
+    float maxScrollY = ImGui::GetScrollMaxY();
     ImGui::EndChild();
+
+    // Pinned ESP Interactive Preview Card on Tab 1 Sub 0 (between MainBody and Right Scrollbar Rail)
+    if (isEspPreviewSub) {
+        ImGui::SetCursorScreenPos(ImVec2(contentX + bodyW + 12.0f, wp.y + 62.0f));
+        ImGui::BeginChild("##vis_prev", ImVec2(espPreviewW, bodyH), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ThemeEngine::PreviewConfig pc{};
+        pc.box        = g_cfgState.bEspBox;
+        pc.boxStyle   = g_cfgState.espBoxStyle;
+        pc.health     = g_cfgState.bEspHealth;
+        pc.armor      = g_cfgState.bEspArmor;
+        pc.name       = g_cfgState.bEspName;
+        pc.playerId   = g_cfgState.bEspPlayerId;
+        pc.skeleton   = g_cfgState.bSkeletonESP;
+        pc.weapon     = g_cfgState.bEspWeapon;
+        pc.distance   = g_cfgState.bEspDistance;
+        pc.snapline   = g_cfgState.bEspLine;
+        pc.lineOrigin = g_cfgState.lineOrigin;
+        pc.boxCol     = IM_COL32((int)(g_cfgState.espBoxCol[0] * 255), (int)(g_cfgState.espBoxCol[1] * 255), (int)(g_cfgState.espBoxCol[2] * 255), 255);
+        int pose = self.previewPose;
+        ThemeEngine::RenderInteractivePreview(pc, pose);
+        self.previewPose = pose;
+        ImGui::EndChild();
+    }
+
+    // Master Right-Side Comfortable Up/Down Scrollbar Rail ([Up] + Wide Drag Thumb + [Down])
+    float nextScrollY = curScrollY;
+    if (ThemeEngine::DrawTouchScrollRail("##deck_scroll_rail",
+                                         ImVec2(contentX + contentW - scrollRailW, wp.y + 62.0f),
+                                         scrollRailW, bodyH, curScrollY, maxScrollY, nextScrollY)) {
+        _pendingScrollY = nextScrollY;
+    }
+
     ImGui::End();
 }
 
