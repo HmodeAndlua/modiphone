@@ -68,6 +68,8 @@ struct ImGuiQueuedTouchEvt {
     ImGuiQueuedTouchEvt _queue[128];
     int     _queueCount;
     CGPoint _lastPos;
+    __weak UITouch* _activeTouch;
+    int     _clearPosFrames;
 }
 - (void)pushEvt:(int)type x:(float)x y:(float)y {
     if (_queueCount < 128) {
@@ -75,31 +77,39 @@ struct ImGuiQueuedTouchEvt {
     }
 }
 - (void)flushToImGui {
-    if (_queueCount <= 0) return;
     ImGuiIO& io = ImGui::GetIO();
-    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    for (int i = 0; i < _queueCount; ++i) {
-        const ImGuiQueuedTouchEvt& ev = _queue[i];
-        if (ev.type == 0) {
-            io.AddMousePosEvent(ev.x, ev.y);
-        } else if (ev.type == 1) {
-            io.AddMouseButtonEvent(0, true);
-        } else if (ev.type == 2) {
-            io.AddMouseButtonEvent(0, false);
+    if (_queueCount > 0) {
+        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+        for (int i = 0; i < _queueCount; ++i) {
+            const ImGuiQueuedTouchEvt& ev = _queue[i];
+            if (ev.type == 0) {
+                io.AddMousePosEvent(ev.x, ev.y);
+            } else if (ev.type == 1) {
+                io.AddMouseButtonEvent(0, true);
+            } else if (ev.type == 2) {
+                io.AddMouseButtonEvent(0, false);
+            }
+        }
+        _queueCount = 0;
+    } else if (_clearPosFrames > 0) {
+        --_clearPosFrames;
+        if (_clearPosFrames == 0 && _activeTouch == nil) {
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         }
     }
-    _queueCount = 0;
 }
 - (void)touchesBegan:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
+    _activeTouch = touch;
+    _clearPosFrames = 0;
     CGPoint p = [touch locationInView:self];
     _lastPos = p;
     [self pushEvt:0 x:(float)p.x y:(float)p.y];
     [self pushEvt:1 x:(float)p.x y:(float)p.y];
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
-    UITouch* touch = t.anyObject;
+    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : t.anyObject;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
     if (std::fabs((double)(p.x - _lastPos.x)) > 0.2 || std::fabs((double)(p.y - _lastPos.y)) > 0.2) {
@@ -108,15 +118,17 @@ struct ImGuiQueuedTouchEvt {
     }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
-    UITouch* touch = t.anyObject;
+    UITouch* touch = (_activeTouch && [t containsObject:_activeTouch]) ? _activeTouch : t.anyObject;
     CGPoint p = touch ? [touch locationInView:self] : _lastPos;
     [self pushEvt:0 x:(float)p.x y:(float)p.y];
     [self pushEvt:2 x:(float)p.x y:(float)p.y];
-    [self pushEvt:0 x:-FLT_MAX y:-FLT_MAX];
+    _activeTouch = nil;
+    _clearPosFrames = 2;
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     [self pushEvt:2 x:(float)_lastPos.x y:(float)_lastPos.y];
-    [self pushEvt:0 x:-FLT_MAX y:-FLT_MAX];
+    _activeTouch = nil;
+    _clearPosFrames = 2;
 }
 @end
 

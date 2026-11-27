@@ -144,6 +144,10 @@ namespace SilentAimHWBP {
 inline std::atomic<uint64_t> g_entry7{0};
 inline std::atomic<uint64_t> g_entry8{0};
 inline std::atomic<uint64_t> g_entryFindPath{0};
+inline std::atomic<uint64_t> g_entryMetaPoll{0};
+inline std::atomic<uint64_t> g_entryPedDispWrite{0};
+inline std::atomic<uint64_t> g_entryMeleeReqWrite{0};
+inline std::atomic<uint64_t> g_entryPredictCombo{0};
 inline std::atomic<void*>    g_m7Info{nullptr};
 inline std::atomic<void*>    g_m8Info{nullptr};
 inline std::atomic<void*>    g_mFindPathInfo{nullptr};
@@ -152,6 +156,10 @@ inline std::atomic<bool>     g_portTried{false};
 inline std::atomic<bool>     g_armed{false};
 inline std::atomic<bool>     g_combatArmed{false};
 inline std::atomic<bool>     g_mapArmed{false};
+inline std::atomic<bool>     g_kaArmed{false};
+inline std::atomic<bool>     g_kaWantPoll{false};
+inline std::atomic<bool>     g_kaWantDisp{false};
+inline std::atomic<bool>     g_kaWantMelee{false};
 inline std::atomic<uint32_t> g_excThreadMachPort{0};
 inline mach_port_t           g_excPort = MACH_PORT_NULL;
 inline pthread_t             g_excThread{};
@@ -228,34 +236,66 @@ inline void ResolveEntriesOnce() {
             if (SafeMem::IsPlausiblePtr(fn)) g_entryFindPath.store(StripPac(reinterpret_cast<uint64_t>(fn)), std::memory_order_release);
         }
     }
+    if (g_entryMetaPoll.load(std::memory_order_acquire) == 0) {
+        if (void* mp = Il2Cpp::ResolveMethod(c.nsFlakeFlow.c_str(), c.clsMetaClientWrapper.c_str(), "Poll", 0)) {
+            void* fn = SafeMem::PtrAt(mp, 0);
+            if (SafeMem::IsPlausiblePtr(fn)) g_entryMetaPoll.store(StripPac(reinterpret_cast<uint64_t>(fn)), std::memory_order_release);
+        }
+    }
+    if (g_entryPedDispWrite.load(std::memory_order_acquire) == 0) {
+        if (void* md = Il2Cpp::ResolveMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Write", 1)) {
+            void* fn = SafeMem::PtrAt(md, 0);
+            if (SafeMem::IsPlausiblePtr(fn)) g_entryPedDispWrite.store(StripPac(reinterpret_cast<uint64_t>(fn)), std::memory_order_release);
+        }
+    }
+    if (g_entryMeleeReqWrite.load(std::memory_order_acquire) == 0) {
+        if (void* mr = Il2Cpp::ResolveMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram", "Write", 1)) {
+            void* fn = SafeMem::PtrAt(mr, 0);
+            if (SafeMem::IsPlausiblePtr(fn)) g_entryMeleeReqWrite.store(StripPac(reinterpret_cast<uint64_t>(fn)), std::memory_order_release);
+        }
+    }
+    if (g_entryPredictCombo.load(std::memory_order_acquire) == 0) {
+        if (void* mc = Il2Cpp::ResolveMethod(c.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "PredictComboDamage", 2)) {
+            void* fn = SafeMem::PtrAt(mc, 0);
+            if (SafeMem::IsPlausiblePtr(fn)) g_entryPredictCombo.store(StripPac(reinterpret_cast<uint64_t>(fn)), std::memory_order_release);
+        }
+    }
 }
 
-inline void PopulateDebugBreakpoints(arm_debug_state64_t& dbg, bool wantCombat, bool wantMap) {
+inline int PopulateDebugBreakpoints(arm_debug_state64_t& dbg, bool wantCombat, bool wantMap, bool wantKa) {
     uint64_t e7 = wantCombat ? g_entry7.load(std::memory_order_acquire) : 0;
     uint64_t e8 = wantCombat ? g_entry8.load(std::memory_order_acquire) : 0;
     uint64_t ef = wantMap ? g_entryFindPath.load(std::memory_order_acquire) : 0;
+    uint64_t mp = (wantKa && g_kaWantPoll.load(std::memory_order_acquire)) ? g_entryMetaPoll.load(std::memory_order_acquire) : 0;
+    uint64_t dw = (wantKa && g_kaWantDisp.load(std::memory_order_acquire)) ? g_entryPedDispWrite.load(std::memory_order_acquire) : 0;
+    uint64_t pc = (wantKa && g_kaWantMelee.load(std::memory_order_acquire)) ? g_entryPredictCombo.load(std::memory_order_acquire) : 0;
+    uint64_t mr = (wantKa && g_kaWantMelee.load(std::memory_order_acquire)) ? g_entryMeleeReqWrite.load(std::memory_order_acquire) : 0;
+
     for (int i = 0; i < 4; ++i) {
         dbg.__bvr[i] = 0;
         dbg.__bcr[i] = 0;
     }
     int slot = 0;
-    if (e7 != 0) {
-        dbg.__bvr[slot] = e7;
+    auto pushSlot = [&](uint64_t addr) {
+        if (addr == 0 || slot >= 4) return;
+        for (int i = 0; i < slot; ++i) {
+            if (dbg.__bvr[i] == addr) return;
+        }
+        dbg.__bvr[slot] = addr;
         dbg.__bcr[slot] = 0x1E7ULL;
         ++slot;
-    }
-    if (e8 != 0 && e8 != e7) {
-        dbg.__bvr[slot] = e8;
-        dbg.__bcr[slot] = 0x1E7ULL;
-        ++slot;
-    }
-    if (ef != 0 && ef != e7 && ef != e8 && slot < 4) {
-        dbg.__bvr[slot] = ef;
-        dbg.__bcr[slot] = 0x1E7ULL;
-    }
+    };
+    pushSlot(e7);
+    pushSlot(e8);
+    pushSlot(ef);
+    pushSlot(mp);
+    pushSlot(dw);
+    pushSlot(pc);
+    pushSlot(mr);
+    return slot;
 }
 
-inline void SetHwbpOnThread(thread_t thr, bool wantCombat, bool wantMap) {
+inline void SetHwbpOnThread(thread_t thr, bool wantCombat, bool wantMap, bool wantKa) {
     if (thr == MACH_PORT_NULL) return;
     uint32_t excThr = g_excThreadMachPort.load(std::memory_order_acquire);
     if (excThr != 0 && thr == excThr) return;
@@ -265,27 +305,32 @@ inline void SetHwbpOnThread(thread_t thr, bool wantCombat, bool wantMap) {
         return;
     // Never interrupt an active single-step trap on a worker thread
     if ((dbg.__mdscr_el1 & 1ULL) != 0) return;
-    if (wantCombat || wantMap) {
-        PopulateDebugBreakpoints(dbg, wantCombat, wantMap);
+    int activeSlots = 0;
+    if (wantCombat || wantMap || wantKa) {
+        activeSlots = PopulateDebugBreakpoints(dbg, wantCombat, wantMap, wantKa);
     } else {
         for (int i = 0; i < 4; ++i) {
             dbg.__bvr[i] = 0;
             dbg.__bcr[i] = 0;
         }
     }
-    if (thread_set_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS && wantMap && wantCombat) {
+    if (thread_set_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS && activeSlots > 2) {
         // Fallback to 2 slots if hardware implements only 2 HW breakpoints
-        PopulateDebugBreakpoints(dbg, true, false);
+        if (wantCombat) {
+            PopulateDebugBreakpoints(dbg, true, false, false);
+        } else {
+            PopulateDebugBreakpoints(dbg, false, false, wantKa);
+        }
         thread_set_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), ARM_DEBUG_STATE64_COUNT);
     }
 }
 
-inline void ApplyAllThreads(bool wantCombat, bool wantMap) {
+inline void ApplyAllThreads(bool wantCombat, bool wantMap, bool wantKa) {
     thread_act_array_t list = nullptr;
     mach_msg_type_number_t count = 0;
     if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS || !list) return;
     for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        SetHwbpOnThread(list[i], wantCombat, wantMap);
+        SetHwbpOnThread(list[i], wantCombat, wantMap, wantKa);
         mach_port_deallocate(mach_task_self(), list[i]);
     }
     vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list), count * sizeof(thread_t));
@@ -302,19 +347,51 @@ inline void HandleBreakpoint(thread_t thr) {
 #else
     uint64_t pc = StripPac(static_cast<uint64_t>(ts.__pc));
 #endif
-    uint64_t e7 = g_entry7.load(std::memory_order_acquire);
-    uint64_t e8 = g_entry8.load(std::memory_order_acquire);
-    uint64_t ef = g_entryFindPath.load(std::memory_order_acquire);
-    bool isEntry7   = (e7 != 0 && pc == e7);
-    bool isEntry8   = (e8 != 0 && pc == e8);
-    bool isFindPath = (ef != 0 && pc == ef);
+    uint64_t e7  = g_entry7.load(std::memory_order_acquire);
+    uint64_t e8  = g_entry8.load(std::memory_order_acquire);
+    uint64_t ef  = g_entryFindPath.load(std::memory_order_acquire);
+    uint64_t emp = g_entryMetaPoll.load(std::memory_order_acquire);
+    uint64_t edw = g_entryPedDispWrite.load(std::memory_order_acquire);
+    uint64_t emr = g_entryMeleeReqWrite.load(std::memory_order_acquire);
+    uint64_t epc = g_entryPredictCombo.load(std::memory_order_acquire);
+    bool isEntry7       = (e7  != 0 && pc == e7);
+    bool isEntry8       = (e8  != 0 && pc == e8);
+    bool isFindPath     = (ef  != 0 && pc == ef);
+    bool isMetaPoll     = (emp != 0 && pc == emp);
+    bool isDispWrite    = (edw != 0 && pc == edw);
+    bool isMeleeReq     = (emr != 0 && pc == emr);
+    bool isPredictCombo = (epc != 0 && pc == epc);
 
     arm_debug_state64_t dbg{};
     mach_msg_type_number_t dbgCnt = ARM_DEBUG_STATE64_COUNT;
     if (thread_get_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), &dbgCnt) != KERN_SUCCESS)
         return;
 
-    if (isEntry7 || isEntry8 || isFindPath) {
+    if (isMetaPoll || isDispWrite || isMeleeReq || isPredictCombo) {
+        if (isMetaPoll) {
+            if (ts.__x[0] > 0x100000000ULL) {
+                KillAround::OnMetaClientPoll(reinterpret_cast<void*>(ts.__x[0]));
+            }
+        } else if (isDispWrite) {
+            KillAround::OnPedDispWriteLockFree(static_cast<uint64_t>(ts.__x[0]));
+        } else if (isMeleeReq) {
+            KillAround::OnMeleeReqWriteLockFree(static_cast<uint64_t>(ts.__x[0]));
+        } else if (isPredictCombo) {
+            bool didOverride = false;
+            int32_t dmg = KillAround::PredictComboDamageOverride(
+                static_cast<int32_t>(ts.__x[1]), (ts.__x[2] & 1ULL) != 0, didOverride);
+            if (didOverride) {
+                ts.__x[0] = static_cast<uint64_t>(static_cast<uint32_t>(dmg));
+                ts.__pc = ts.__lr;
+                thread_set_state(thr, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&ts), ARM_THREAD_STATE64_COUNT);
+                return;
+            }
+        }
+        // Single-step 1 instruction past entry, then re-arm HWBP on the next trap
+        for (int i = 0; i < 4; ++i) dbg.__bcr[i] = 0;
+        dbg.__mdscr_el1 |= 1ULL;
+        thread_set_state(thr, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg), ARM_DEBUG_STATE64_COUNT);
+    } else if (isEntry7 || isEntry8 || isFindPath) {
         if (isFindPath) {
             if (ts.__x[0] > 0x100000000ULL) {
                 g_navGraphInst.store(reinterpret_cast<void*>(ts.__x[0]), std::memory_order_release);
@@ -387,10 +464,11 @@ inline void HandleBreakpoint(thread_t thr) {
     } else {
         // Single-step trap: clear SS bit and re-arm active breakpoints
         dbg.__mdscr_el1 &= ~1ULL;
-        bool wc = g_combatArmed.load(std::memory_order_acquire);
-        bool wm = g_mapArmed.load(std::memory_order_acquire);
-        if (wc || wm) {
-            PopulateDebugBreakpoints(dbg, wc, wm);
+        bool wc  = g_combatArmed.load(std::memory_order_acquire);
+        bool wm  = g_mapArmed.load(std::memory_order_acquire);
+        bool wka = g_kaArmed.load(std::memory_order_acquire);
+        if (wc || wm || wka) {
+            PopulateDebugBreakpoints(dbg, wc, wm, wka);
         } else {
             for (int i = 0; i < 4; ++i) {
                 dbg.__bvr[i] = 0;
@@ -498,21 +576,49 @@ inline void Tick() {
     if (!Morpeh::g_stashes.worldReady) return;
     ResolveLayerMasksOnce();
 
+    const int64_t kaNowMs = KillAround::GetMonotonicMs();
+    const bool kaActive = (g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
+                           KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > kaNowMs);
+    const bool wantPoll  = !Il2Cpp::IsUnityObjectSafe(KillAround::g_metaClient.load(std::memory_order_acquire));
+    const bool wantDisp  = (KillAround::g_LastRemoteTime.load(std::memory_order_acquire) <= 1000.0) || kaActive;
+    const bool wantMelee = kaActive && g_cfgState.bKillAroundOneHit;
+
+    g_kaWantPoll.store(wantPoll, std::memory_order_release);
+    g_kaWantDisp.store(wantDisp, std::memory_order_release);
+    g_kaWantMelee.store(wantMelee, std::memory_order_release);
+
     bool wantCombat = (!g_cfgState.bMasterDisable && (g_cfgState.bSilentAim || g_cfgState.bSilentWallbang));
-    if (wantCombat) {
+    bool wantKa     = (!g_cfgState.bMasterDisable && (wantPoll || wantDisp || wantMelee));
+
+    if (wantCombat || wantKa) {
         ResolveEntriesOnce();
-        if (g_entry7.load(std::memory_order_acquire) != 0 || g_entry8.load(std::memory_order_acquire) != 0) {
+        const bool haveCombatEntry = (g_entry7.load(std::memory_order_acquire) != 0 || g_entry8.load(std::memory_order_acquire) != 0);
+        const bool haveKaEntry     = (g_entryMetaPoll.load(std::memory_order_acquire) != 0 ||
+                                      g_entryPedDispWrite.load(std::memory_order_acquire) != 0 ||
+                                      g_entryPredictCombo.load(std::memory_order_acquire) != 0);
+        if ((wantCombat && haveCombatEntry) || (wantKa && haveKaEntry)) {
             EnsurePortInstalled();
             if (!g_portReady.load(std::memory_order_acquire)) return;
 
-            bool prevCombat = g_combatArmed.exchange(true, std::memory_order_acq_rel);
+            bool prevCombat = g_combatArmed.exchange(wantCombat && haveCombatEntry, std::memory_order_acq_rel);
+            bool prevKa     = g_kaArmed.exchange(wantKa && haveKaEntry, std::memory_order_acq_rel);
+            bool prevPoll   = wantPoll;
+            static bool s_prevPoll = false, s_prevDisp = false, s_prevMelee = false;
             g_mapArmed.store(false, std::memory_order_release);
             g_armed.store(true, std::memory_order_release);
 
+            bool modeChanged = (prevCombat != (wantCombat && haveCombatEntry)) ||
+                               (prevKa     != (wantKa && haveKaEntry)) ||
+                               (s_prevPoll != wantPoll) || (s_prevDisp != wantDisp) || (s_prevMelee != wantMelee);
+            s_prevPoll  = wantPoll;
+            s_prevDisp  = wantDisp;
+            s_prevMelee = wantMelee;
+            (void)prevPoll;
+
             static double s_lastReapply = 0.0;
             double now = CACurrentMediaTime();
-            if (!prevCombat || (now - s_lastReapply) >= 0.85) {
-                ApplyAllThreads(true, false);
+            if (modeChanged || (now - s_lastReapply) >= 0.85) {
+                ApplyAllThreads(wantCombat && haveCombatEntry, false, wantKa && haveKaEntry);
                 s_lastReapply = now;
             }
             return;
@@ -521,9 +627,10 @@ inline void Tick() {
 
     bool wasCombat = g_combatArmed.exchange(false, std::memory_order_acq_rel);
     bool wasMap    = g_mapArmed.exchange(false, std::memory_order_acq_rel);
+    bool wasKa     = g_kaArmed.exchange(false, std::memory_order_acq_rel);
     g_armed.store(false, std::memory_order_release);
-    if (wasCombat || wasMap) {
-        ApplyAllThreads(false, false);
+    if (wasCombat || wasMap || wasKa) {
+        ApplyAllThreads(false, false, false);
     }
 }
 
@@ -1355,15 +1462,21 @@ inline void InstallLazyFeatureHooks() {
                 Il2Cpp::SwapMethodPointer(m, (void*)Hook_RayCastRanged8, (void**)&orig_RayCastRanged8);
         }
     }
-    if (Morpeh::g_stashes.worldReady && !g_kaCaptureHooksInstalled) {
+    if (Morpeh::g_stashes.worldReady && !g_kaCaptureHooksInstalled &&
+        SilentAimHWBP::g_portTried.load(std::memory_order_acquire)) {
         g_kaCaptureHooksInstalled = true;
-        if (void* m = Il2Cpp::ResolveMethod(c.nsFlakeFlow.c_str(), c.clsMetaClientWrapper.c_str(), "Poll", 0))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_MetaPoll, (void**)&orig_MetaPoll);
-        if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "PredictComboDamage", 2))
-            Il2Cpp::SwapMethodPointer(m, (void*)Hook_PredictComboDamage, (void**)&orig_PredictComboDamage);
+        SilentAimHWBP::ResolveEntriesOnce();
+        if (!SilentAimHWBP::g_portReady.load(std::memory_order_acquire)) {
+            if (void* m = Il2Cpp::ResolveMethod(c.nsFlakeFlow.c_str(), c.clsMetaClientWrapper.c_str(), "Poll", 0))
+                Il2Cpp::SwapMethodPointer(m, (void*)Hook_MetaPoll, (void**)&orig_MetaPoll);
+            if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "PredictComboDamage", 2))
+                Il2Cpp::SwapMethodPointer(m, (void*)Hook_PredictComboDamage, (void**)&orig_PredictComboDamage);
+        }
     }
-    if (!g_killAroundHooksInstalled && Morpeh::g_stashes.worldReady) {
+    if (!g_killAroundHooksInstalled && Morpeh::g_stashes.worldReady &&
+        SilentAimHWBP::g_portTried.load(std::memory_order_acquire)) {
         g_killAroundHooksInstalled = true;
+        SilentAimHWBP::ResolveEntriesOnce();
         Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Read", 1,
                                   (void*)Hook_PedDispRead, (void**)&orig_PedDispRead);
         Il2Cpp::SwapVirtualMethod(c.nsIBNetPedSync.c_str(), "PedDeadDatagram", "Read", 1,

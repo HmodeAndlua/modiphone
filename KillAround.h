@@ -14,6 +14,7 @@
 // KillAround.h — Direct iOS arm64 port of kill_around (2).h + mainTOW.cpp
 // Runs all engine/IL2CPP operations strictly on UnityMain (Tick), protected by TCFlyGuard + SafeMem.
 // Menu (DrawPanel) reads only cached game-thread snapshots.
+// Dual transport: generic MetaClientWrapper.Send<T> + automatic non-generic HostCommandWriter.WriteSend fallback for iOS AOT.
 
 namespace KillAround {
 
@@ -122,33 +123,59 @@ inline std::atomic<int32_t> g_AttackWrites{0};
 inline std::atomic<int32_t> g_SendCalls{0};
 inline std::atomic<int32_t> g_SendOk{0};
 inline std::atomic<int32_t> g_SendFail{0};
+inline std::atomic<int32_t> g_TxMode{0}; // 0=init, 1=generic, 2=raw wire
 
 inline uint8_t              g_MeleeTemplate[0x40]{};
 inline std::atomic<bool>    g_HasMeleeTemplate{false};
 
-// Client capture (Hook_MetaPoll + GlobalContextCore.MetaClientWrapper + SimpleDImple)
+// Client capture (HWBP Poll + GlobalContextCore.MetaClientWrapper + SimpleDImple + Poll hook)
 inline std::atomic<void*>   g_metaClient{nullptr};
 inline void*                g_KaClient = nullptr;
 inline int64_t              g_KaClientTryMs = 0;
 
-// Cached datagram Il2CppClass* for unbox normalization
+// Cached datagram Il2CppClass* for unbox normalization & lock-free HWBP access
 inline void*                g_kaClsPedDisp  = nullptr;
 inline void*                g_kaClsPedDead  = nullptr;
 inline void*                g_kaClsMeleeAtk = nullptr;
 inline void*                g_kaClsMeleeReq = nullptr;
+inline std::atomic<void*>   g_clsPedDispAtomic{nullptr};
+inline std::atomic<void*>   g_clsMeleeReqAtomic{nullptr};
 
 struct SendEntry {
     const char* name = nullptr;
+    const char* ns = nullptr;
     uint32_t    methodGch = 0;
     void*       dgramKlass = nullptr;
-    bool        failed = false;
+    bool        genFailed = false;
+    bool        wireReady = false;
+    bool        wireFailed = false;
+    uint64_t    packetId = 0;
+    uint8_t     netChannel = 16; // NetChannel::Reliable
+    void*       writeMethod = nullptr;
 };
 inline SendEntry g_Senders[8]{};
 inline int       g_SenderCount = 0;
 inline void*     g_ObjectKlass = nullptr;
 inline void*     g_MethodBaseInvoke = nullptr;
 
-inline double    g_LastRemoteTime = 0.0;
+struct WireCtx {
+    bool     tried = false;
+    bool     ready = false;
+    uint32_t writerGch = 0;
+    void*    writerResetM = nullptr;
+    void*    writerToSegM = nullptr;
+    void*    numSerWriteUlongM = nullptr;
+    void*    cmdWriterWriteSendM = nullptr;
+    size_t   offMcHandler = 0x28;
+    size_t   offMcClient = 0x38;
+    size_t   offFfPeerProv = 0x20;
+    size_t   offFfCmdWriter = 0x30;
+    size_t   offPpAssigned = 0x10;
+    size_t   offPpPeer = 0x14;
+};
+inline WireCtx g_Wire{};
+
+inline std::atomic<double> g_LastRemoteTime{0.0};
 inline bool      g_kaHasActiveGhost = false; // g_GhostActive
 inline int64_t   g_GhostHoldUntil = 0;
 
@@ -163,6 +190,23 @@ inline std::mutex g_LocalPosMtx;
 inline bool       g_LocalPosOk = false;
 inline Vec3       g_LocalPosCache{};
 inline int64_t    g_LocalPosMs = 0;
+
+inline void RecordRemoteTime(double rt) {
+    if (!std::isfinite(rt) || rt <= 1000.0 || rt >= 1e9) return;
+    double cur = g_LastRemoteTime.load(std::memory_order_relaxed);
+    while (rt > cur) {
+        if (g_LastRemoteTime.compare_exchange_weak(cur, rt, std::memory_order_release, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+inline double AdvanceRemoteTime(double deltaSec) {
+    double cur = g_LastRemoteTime.load(std::memory_order_acquire);
+    double next = (cur > 0.0 ? cur : 1.0) + deltaSec;
+    g_LastRemoteTime.store(next, std::memory_order_release);
+    return next;
+}
 
 inline bool LookupName(int32_t elemId, std::string* out) {
     std::lock_guard<std::mutex> lk(g_Mtx);
@@ -188,21 +232,282 @@ inline void* ClientForSend() {
         return g_KaClient;
     }
     const int64_t now = GetMonotonicMs();
-    if (now - g_KaClientTryMs < 500) return nullptr;
+    if (now - g_KaClientTryMs < 400) return nullptr;
     g_KaClientTryMs = now;
     void* c = ResolveMetaClientFromGlobals();
-    if (Il2Cpp::IsUnityObjectSafe(c)) g_KaClient = c;
+    if (Il2Cpp::IsUnityObjectSafe(c)) {
+        g_KaClient = c;
+        if (!g_metaClient.load(std::memory_order_relaxed)) {
+            g_metaClient.store(c, std::memory_order_release);
+        }
+    }
     return g_KaClient;
 }
 
-// Exact kill_around (2).h SendDatagramImpl using value_box + RuntimeMethodInfo.MakeGenericMethod + MethodBase.Invoke
+inline void PrecacheDatagramClassesOnce() {
+    if (!Il2Cpp::Init()) return;
+    if (!g_kaClsPedDisp) {
+        g_kaClsPedDisp = Il2Cpp::FindClass(Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
+        if (g_kaClsPedDisp) g_clsPedDispAtomic.store(g_kaClsPedDisp, std::memory_order_release);
+    }
+    if (!g_kaClsMeleeReq) {
+        g_kaClsMeleeReq = Il2Cpp::FindClass(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
+        if (g_kaClsMeleeReq) g_clsMeleeReqAtomic.store(g_kaClsMeleeReq, std::memory_order_release);
+    }
+}
+
+// Compute/seed exact server RemoteTime from MetaClientWrapper.GetServerTime() - TimeConstants.ZeroTimestampDatetime
+inline void SyncServerTimeFallback(void* client) {
+    if (g_LastRemoteTime.load(std::memory_order_acquire) > 1000.0) return;
+    if (!Il2Cpp::IsUnityObjectSafe(client) || !Il2Cpp::Init()) return;
+
+    static void* s_getSrvTimeM = nullptr;
+    static void* s_getZeroDtM  = nullptr;
+    static bool  s_resolved    = false;
+    if (!s_resolved) {
+        s_resolved    = true;
+        s_getSrvTimeM = Il2Cpp::ResolveMethod("FlakeFlow", "MetaClientWrapper", "GetServerTime", 0);
+        s_getZeroDtM  = Il2Cpp::ResolveMethod("FlakeFlow", "TimeConstants", "get_ZeroTimestampDatetime", 0);
+    }
+    if (!s_getSrvTimeM || !s_getZeroDtM || !Il2Cpp::g_api.object_unbox) return;
+
+    void* boxedSrv  = Il2Cpp::SafeInvoke(s_getSrvTimeM, client, nullptr);
+    void* boxedZero = Il2Cpp::SafeInvoke(s_getZeroDtM, nullptr, nullptr);
+    if (!boxedSrv || !boxedZero) return;
+
+    uint64_t srvData = 0, zeroData = 0;
+    if (!SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedSrv), srvData)) return;
+    if (!SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedZero), zeroData)) return;
+
+    const uint64_t srvTicks  = srvData  & 0x3FFFFFFFFFFFFFFFULL;
+    const uint64_t zeroTicks = zeroData & 0x3FFFFFFFFFFFFFFFULL;
+    if (srvTicks > zeroTicks) {
+        const double rt = static_cast<double>(srvTicks - zeroTicks) / 10000000.0;
+        RecordRemoteTime(rt);
+    }
+}
+
+// Initializes non-generic FlakeFlow wire pipeline (IBNet_Writer + NumberSerializer + HostCommandWriter.WriteSend)
+inline bool EnsureWireCtxReady() {
+    if (g_Wire.ready) return true;
+    if (g_Wire.tried) return false;
+    g_Wire.tried = true;
+
+    if (!Il2Cpp::Init() || !Il2Cpp::g_api.object_new || !Il2Cpp::g_api.gchandle_new ||
+        !Il2Cpp::g_api.gchandle_get_target || !Il2Cpp::g_api.object_unbox) {
+        return false;
+    }
+
+    void* mcK   = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
+    void* ffK   = Il2Cpp::FindClass("FlakeFlow", "FlakeFlowClient");
+    void* ppK   = Il2Cpp::FindClass("FlakeFlow", "ClientPeerProvider");
+    void* hcwK  = Il2Cpp::FindClass("FlakeFlow", "HostCommandWriter");
+    void* wK    = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "IBNet_Writer");
+    void* nsK   = Il2Cpp::FindClass("dev.Scripts.Networking.IBNet", "NumberSerializer");
+    if (!mcK || !ffK || !ppK || !hcwK || !wK || !nsK) return false;
+
+    g_Wire.offMcHandler   = Il2Cpp::FieldOffset(mcK, "_datagramHandler", 0x28);
+    g_Wire.offMcClient    = Il2Cpp::FieldOffset(mcK, "_client", 0x38);
+    g_Wire.offFfPeerProv  = Il2Cpp::FieldOffset(ffK, "_peerProvider", 0x20);
+    g_Wire.offFfCmdWriter = Il2Cpp::FieldOffset(ffK, "_commandWriter", 0x30);
+    g_Wire.offPpAssigned  = Il2Cpp::FieldOffset(ppK, "_isAssigned", 0x10);
+    g_Wire.offPpPeer      = Il2Cpp::FieldOffset(ppK, "<MetaPeer>k__BackingField", 0x14);
+
+    void* wCtor = Il2Cpp::g_api.class_get_method_from_name(wK, ".ctor", 1);
+    g_Wire.writerResetM        = Il2Cpp::g_api.class_get_method_from_name(wK, "Reset", 0);
+    g_Wire.writerToSegM        = Il2Cpp::g_api.class_get_method_from_name(wK, "ToArraySegment", 0);
+    g_Wire.numSerWriteUlongM   = Il2Cpp::g_api.class_get_method_from_name(nsK, "WriteULong", 2);
+    g_Wire.cmdWriterWriteSendM = Il2Cpp::g_api.class_get_method_from_name(hcwK, "WriteSend", 3);
+    if (!wCtor || !g_Wire.writerResetM || !g_Wire.writerToSegM ||
+        !g_Wire.numSerWriteUlongM || !g_Wire.cmdWriterWriteSendM) {
+        return false;
+    }
+
+    void* writerObj = nullptr;
+    void* exc = nullptr;
+    TCFlyGuard::TryRun([&]() {
+        Il2Cpp::EnsureThreadAttached();
+        writerObj = Il2Cpp::g_api.object_new(wK);
+        if (SafeMem::IsPlausiblePtr(writerObj)) {
+            int32_t cap = 512;
+            void* args[1] = { &cap };
+            Il2Cpp::g_api.runtime_invoke(wCtor, writerObj, args, &exc);
+        }
+    });
+    if (!SafeMem::IsPlausiblePtr(writerObj) || exc != nullptr) return false;
+
+    g_Wire.writerGch = Il2Cpp::g_api.gchandle_new(writerObj, true);
+    g_Wire.ready = (g_Wire.writerGch != 0);
+    return g_Wire.ready;
+}
+
+// Looks up exact PacketId and NetChannel from static FlakeFlow.MetaTypeInfo.IdToInfo dictionary
+inline bool LookupMetaTypeInfo(void* dgramKlass, const char* ns, const char* dgramName, uint64_t& outPacketId, uint8_t& outChannel) {
+    if (!Il2Cpp::Init() || !dgramKlass) return false;
+
+    if (Il2Cpp::g_api.class_get_type && Il2Cpp::g_api.type_get_object) {
+        void* dgType    = Il2Cpp::g_api.class_get_type(dgramKlass);
+        void* dgTypeObj = dgType ? Il2Cpp::g_api.type_get_object(dgType) : nullptr;
+        void* dict = Il2Cpp::ResolveStaticClassFieldPtr("FlakeFlow", "MetaTypeInfo", "IdToInfo");
+        if (!dict) {
+            if (void* warmM = Il2Cpp::ResolveMethod("FlakeFlow", "MetaTypeInfo", "Warmup", 0)) {
+                Il2Cpp::SafeInvoke(warmM, nullptr, nullptr);
+                dict = Il2Cpp::ResolveStaticClassFieldPtr("FlakeFlow", "MetaTypeInfo", "IdToInfo");
+            }
+        }
+        if (Il2Cpp::IsUnityObjectSafe(dict) && SafeMem::IsPlausiblePtr(dgTypeObj)) {
+            void* dictK = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(dict) : nullptr;
+            size_t offEntries = Il2Cpp::FieldOffset(dictK, "_entries", 0x18);
+            size_t offCount   = Il2Cpp::FieldOffset(dictK, "_count", 0x20);
+            void* entriesArr  = SafeMem::PtrAt(dict, offEntries);
+            int32_t count     = 0;
+            SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(dict) + offCount, count);
+            if (Il2Cpp::IsUnityObjectSafe(entriesArr) && count > 0 && count < 4096) {
+                int32_t arrLen = 0;
+                SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(entriesArr) + 0x18, arrLen);
+                int32_t stride = Il2Cpp::g_api.array_element_size ? Il2Cpp::g_api.array_element_size(entriesArr) : 24;
+                if (stride >= 24 && stride <= 64 && arrLen > 0) {
+                    const int32_t limit = std::min(count, arrLen);
+                    void* mtiK = Il2Cpp::FindClass("FlakeFlow", "MetaTypeInfo");
+                    size_t offType = Il2Cpp::FieldOffset(mtiK, "type", 0x10);
+                    size_t offId   = Il2Cpp::FieldOffset(mtiK, "PacketId", 0x20);
+                    size_t offChan = Il2Cpp::FieldOffset(mtiK, "NetChannel", 0x28);
+                    const uint8_t* base = reinterpret_cast<const uint8_t*>(entriesArr) + 0x20;
+                    for (int32_t i = 0; i < limit; ++i) {
+                        const uint8_t* ent = base + static_cast<size_t>(i) * static_cast<size_t>(stride);
+                        int32_t hc = -1;
+                        SafeMem::ReadVal(ent, hc);
+                        if (hc < 0) continue;
+                        void* mtiObj = nullptr;
+                        SafeMem::ReadVal(ent + 0x10, mtiObj);
+                        if (!Il2Cpp::IsUnityObjectSafe(mtiObj)) continue;
+                        void* entryType = SafeMem::PtrAt(mtiObj, offType);
+                        if (entryType == dgTypeObj) {
+                            uint64_t pid = 0;
+                            uint8_t  ch  = 16;
+                            SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(mtiObj) + offId, pid);
+                            SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(mtiObj) + offChan, ch);
+                            if (pid != 0) {
+                                outPacketId = pid;
+                                outChannel  = (ch == 16 || ch == 32) ? ch : 16;
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback via FlakeFlow.HashUtility.Fnv1A64("Namespace.TypeName")
+    if (void* fnvM = Il2Cpp::ResolveMethod("FlakeFlow", "HashUtility", "Fnv1A64", 1)) {
+        if (Il2Cpp::g_api.string_new && Il2Cpp::g_api.object_unbox) {
+            std::string fullName = (ns && ns[0]) ? (std::string(ns) + "." + dgramName) : std::string(dgramName);
+            void* sObj = Il2Cpp::g_api.string_new(fullName.c_str());
+            if (sObj) {
+                void* args[1] = { sObj };
+                void* boxedHash = Il2Cpp::SafeInvoke(fnvM, nullptr, args);
+                if (boxedHash) {
+                    uint64_t pid = 0;
+                    if (SafeMem::ReadVal(Il2Cpp::g_api.object_unbox(boxedHash), pid) && pid != 0) {
+                        outPacketId = pid;
+                        outChannel  = (std::strcmp(dgramName, "PedDisplacementSyncDatagram") == 0) ? 32 : 16;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Non-generic wire path (zero MakeGenericMethod, works 100% in iOS Full AOT for any datagram type)
+inline bool SendDatagramRawWire(void* clientObj, SendEntry* e, uint8_t* box, size_t payloadSize) {
+    if (!e || e->wireFailed || !Il2Cpp::IsUnityObjectSafe(clientObj)) return false;
+    if (!EnsureWireCtxReady()) return false;
+
+    if (!e->dgramKlass) {
+        e->dgramKlass = Il2Cpp::FindClass(e->ns, e->name);
+        if (!e->dgramKlass) { e->wireFailed = true; return false; }
+    }
+    if (!e->wireReady) {
+        uint64_t pid = 0;
+        uint8_t  ch  = 16;
+        if (!LookupMetaTypeInfo(e->dgramKlass, e->ns, e->name, pid, ch)) {
+            e->wireFailed = true;
+            return false;
+        }
+        void* writeM = Il2Cpp::g_api.class_get_method_from_name(e->dgramKlass, "Write", 1);
+        void* writeFn = writeM ? SafeMem::PtrAt(writeM, 0) : nullptr;
+        if (!writeM || !SafeMem::IsPlausiblePtr(writeFn)) {
+            e->wireFailed = true;
+            return false;
+        }
+        e->packetId    = pid;
+        e->netChannel  = ch;
+        e->writeMethod = writeM;
+        e->wireReady   = true;
+    }
+
+    void* ffClient = SafeMem::PtrAt(clientObj, g_Wire.offMcClient);
+    if (!Il2Cpp::IsUnityObjectSafe(ffClient)) return false;
+
+    void* peerProv  = SafeMem::PtrAt(ffClient, g_Wire.offFfPeerProv);
+    void* cmdWriter = SafeMem::PtrAt(ffClient, g_Wire.offFfCmdWriter);
+    if (!Il2Cpp::IsUnityObjectSafe(peerProv) || !Il2Cpp::IsUnityObjectSafe(cmdWriter)) return false;
+
+    uint8_t isAssigned = 0;
+    SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(peerProv) + g_Wire.offPpAssigned, isAssigned);
+    if (!isAssigned) return false;
+
+    struct MetaPeerRaw { int32_t Id; int32_t Gen; } peer{};
+    if (!SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(peerProv) + g_Wire.offPpPeer, peer)) return false;
+
+    void* writerObj = Il2Cpp::g_api.gchandle_get_target(g_Wire.writerGch);
+    if (!Il2Cpp::IsUnityObjectSafe(writerObj)) return false;
+
+    bool ok = false;
+    (void)payloadSize;
+    TCFlyGuard::TryRun([&]() {
+        Il2Cpp::EnsureThreadAttached();
+        void* exc = nullptr;
+        Il2Cpp::g_api.runtime_invoke(g_Wire.writerResetM, writerObj, nullptr, &exc);
+        if (exc) return;
+
+        uint64_t pktId = e->packetId;
+        void* hdrArgs[2] = { writerObj, &pktId };
+        Il2Cpp::g_api.runtime_invoke(g_Wire.numSerWriteUlongM, nullptr, hdrArgs, &exc);
+        if (exc) return;
+
+        void* writeFnPtr = SafeMem::PtrAt(e->writeMethod, 0);
+        if (!SafeMem::IsPlausiblePtr(writeFnPtr)) return;
+        using StructWriteFn = void (*)(void*, void*, void*);
+        reinterpret_cast<StructWriteFn>(writeFnPtr)(box, writerObj, e->writeMethod);
+
+        exc = nullptr;
+        void* boxedSeg = Il2Cpp::g_api.runtime_invoke(g_Wire.writerToSegM, writerObj, nullptr, &exc);
+        if (!SafeMem::IsPlausiblePtr(boxedSeg) || exc) return;
+
+        void* segPtr = Il2Cpp::g_api.object_unbox(boxedSeg);
+        if (!SafeMem::IsPlausiblePtr(segPtr)) return;
+
+        uint8_t ch = e->netChannel;
+        void* sendArgs[3] = { &peer, segPtr, &ch };
+        exc = nullptr;
+        Il2Cpp::g_api.runtime_invoke(g_Wire.cmdWriterWriteSendM, cmdWriter, sendArgs, &exc);
+        ok = (exc == nullptr);
+    });
+    if (ok) {
+        g_TxMode.store(2, std::memory_order_release);
+    }
+    return ok;
+}
+
+// Generic MetaClientWrapper.Send<T> primary + automatic raw HostCommandWriter.WriteSend fallback
 inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* payload, size_t payloadSize) {
     void* client = ClientForSend();
     if (!Il2Cpp::IsUnityObjectSafe(client) || payloadSize > 0x200) return false;
-    if (!Il2Cpp::Init() || !Il2Cpp::g_api.value_box || !Il2Cpp::g_api.array_new ||
-        !Il2Cpp::g_api.method_get_object || !Il2Cpp::g_api.gchandle_new || !Il2Cpp::g_api.gchandle_get_target) {
-        return false;
-    }
+    if (!Il2Cpp::Init()) return false;
 
     SendEntry* e = nullptr;
     for (int i = 0; i < g_SenderCount; ++i) {
@@ -215,74 +520,86 @@ inline bool SendDatagramImpl(const char* ns, const char* dgramName, const void* 
         if (g_SenderCount >= 8) return false;
         e = &g_Senders[g_SenderCount++];
         e->name = dgramName;
+        e->ns   = ns;
     }
-    if (e->failed) return false;
 
     uint8_t box[0x200]{};
     if (payload && payloadSize > 0) std::memcpy(box, payload, payloadSize);
 
-    bool ok = false;
-    TCFlyGuard::TryRun([&]() {
-        Il2Cpp::EnsureThreadAttached();
-        void* exc = nullptr;
-        if (e->methodGch == 0) {
-            void* wrapperK = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
-            e->dgramKlass  = Il2Cpp::FindClass(ns, dgramName);
-            void* typeK    = Il2Cpp::FindClass("System", "Type");
-            if (!g_ObjectKlass) g_ObjectKlass = Il2Cpp::FindClass("System", "Object");
-            void* miK      = Il2Cpp::FindClass("System.Reflection", "MethodInfo");
-            void* rmiK     = Il2Cpp::FindClass("System.Reflection", "RuntimeMethodInfo");
-            void* mbK      = Il2Cpp::FindClass("System.Reflection", "MethodBase");
-            if (!wrapperK || !e->dgramKlass || !typeK || !g_ObjectKlass || !miK || !mbK) {
-                e->failed = true;
-                return;
+    if (!e->genFailed && Il2Cpp::g_api.value_box && Il2Cpp::g_api.array_new &&
+        Il2Cpp::g_api.method_get_object && Il2Cpp::g_api.gchandle_new && Il2Cpp::g_api.gchandle_get_target) {
+        bool ok = false;
+        TCFlyGuard::TryRun([&]() {
+            Il2Cpp::EnsureThreadAttached();
+            void* exc = nullptr;
+            if (e->methodGch == 0) {
+                void* wrapperK = Il2Cpp::FindClass("FlakeFlow", "MetaClientWrapper");
+                if (!e->dgramKlass) e->dgramKlass = Il2Cpp::FindClass(ns, dgramName);
+                void* typeK    = Il2Cpp::FindClass("System", "Type");
+                if (!g_ObjectKlass) g_ObjectKlass = Il2Cpp::FindClass("System", "Object");
+                void* miK      = Il2Cpp::FindClass("System.Reflection", "MethodInfo");
+                void* rmiK     = Il2Cpp::FindClass("System.Reflection", "RuntimeMethodInfo");
+                void* mbK      = Il2Cpp::FindClass("System.Reflection", "MethodBase");
+                if (!wrapperK || !e->dgramKlass || !typeK || !g_ObjectKlass || !miK || !mbK) {
+                    e->genFailed = true;
+                    return;
+                }
+
+                const void* sendM = Il2Cpp::g_api.class_get_method_from_name(wrapperK, "Send", 1);
+                void* sendObj     = sendM ? Il2Cpp::g_api.method_get_object(sendM, wrapperK) : nullptr;
+                void* makeGen     = rmiK ? Il2Cpp::g_api.class_get_method_from_name(rmiK, "MakeGenericMethod", 1) : nullptr;
+                if (!makeGen) makeGen = Il2Cpp::g_api.class_get_method_from_name(miK, "MakeGenericMethod", 1);
+                void* typeArr     = (sendObj && makeGen) ? Il2Cpp::g_api.array_new(typeK, 1) : nullptr;
+                void* dgType      = (typeArr && Il2Cpp::g_api.class_get_type) ? Il2Cpp::g_api.class_get_type(e->dgramKlass) : nullptr;
+                void* dgTypeObj   = (dgType && Il2Cpp::g_api.type_get_object) ? Il2Cpp::g_api.type_get_object(dgType) : nullptr;
+                if (!typeArr || !dgTypeObj) {
+                    e->genFailed = true;
+                    return;
+                }
+
+                *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(typeArr) + 0x20) = dgTypeObj;
+                void* args[1] = { typeArr };
+                void* concrete = Il2Cpp::g_api.runtime_invoke(makeGen, sendObj, args, &exc);
+                if (!SafeMem::IsPlausiblePtr(concrete) || exc) {
+                    e->genFailed = true;
+                    return;
+                }
+                if (!g_MethodBaseInvoke) {
+                    g_MethodBaseInvoke = Il2Cpp::g_api.class_get_method_from_name(mbK, "Invoke", 2);
+                }
+                e->methodGch = Il2Cpp::g_api.gchandle_new(concrete, false);
+                if (!e->methodGch || !g_MethodBaseInvoke) {
+                    e->genFailed = true;
+                    return;
+                }
             }
 
-            const void* sendM = Il2Cpp::g_api.class_get_method_from_name(wrapperK, "Send", 1);
-            void* sendObj     = sendM ? Il2Cpp::g_api.method_get_object(sendM, wrapperK) : nullptr;
-            void* makeGen     = rmiK ? Il2Cpp::g_api.class_get_method_from_name(rmiK, "MakeGenericMethod", 1) : nullptr;
-            if (!makeGen) makeGen = Il2Cpp::g_api.class_get_method_from_name(miK, "MakeGenericMethod", 1);
-            void* typeArr     = (sendObj && makeGen) ? Il2Cpp::g_api.array_new(typeK, 1) : nullptr;
-            void* dgType      = (typeArr && Il2Cpp::g_api.class_get_type) ? Il2Cpp::g_api.class_get_type(e->dgramKlass) : nullptr;
-            void* dgTypeObj   = (dgType && Il2Cpp::g_api.type_get_object) ? Il2Cpp::g_api.type_get_object(dgType) : nullptr;
-            if (!typeArr || !dgTypeObj) {
-                e->failed = true;
+            void* mObj = Il2Cpp::g_api.gchandle_get_target(e->methodGch);
+            if (!Il2Cpp::IsUnityObjectSafe(mObj)) {
+                e->methodGch = 0;
                 return;
             }
+            void* boxed  = Il2Cpp::g_api.value_box(e->dgramKlass, box);
+            void* objArr = SafeMem::IsPlausiblePtr(boxed) ? Il2Cpp::g_api.array_new(g_ObjectKlass, 1) : nullptr;
+            if (SafeMem::IsPlausiblePtr(boxed) && SafeMem::IsPlausiblePtr(objArr)) {
+                *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(objArr) + 0x20) = boxed;
+                void* invArgs[2] = { client, objArr };
+                exc = nullptr;
+                Il2Cpp::g_api.runtime_invoke(g_MethodBaseInvoke, mObj, invArgs, &exc);
+                ok = (exc == nullptr);
+                if (exc) e->genFailed = true;
+            }
+        });
+        if (ok) {
+            if (g_TxMode.load(std::memory_order_relaxed) == 0) {
+                g_TxMode.store(1, std::memory_order_release);
+            }
+            return true;
+        }
+    }
 
-            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(typeArr) + 0x20) = dgTypeObj;
-            void* args[1] = { typeArr };
-            void* concrete = Il2Cpp::g_api.runtime_invoke(makeGen, sendObj, args, &exc);
-            if (!SafeMem::IsPlausiblePtr(concrete) || exc) {
-                e->failed = true;
-                return;
-            }
-            if (!g_MethodBaseInvoke) {
-                g_MethodBaseInvoke = Il2Cpp::g_api.class_get_method_from_name(mbK, "Invoke", 2);
-            }
-            e->methodGch = Il2Cpp::g_api.gchandle_new(concrete, false);
-            if (!e->methodGch || !g_MethodBaseInvoke) {
-                e->failed = true;
-                return;
-            }
-        }
-
-        void* mObj = Il2Cpp::g_api.gchandle_get_target(e->methodGch);
-        if (!Il2Cpp::IsUnityObjectSafe(mObj)) {
-            e->methodGch = 0;
-            return;
-        }
-        void* boxed  = Il2Cpp::g_api.value_box(e->dgramKlass, box);
-        void* objArr = SafeMem::IsPlausiblePtr(boxed) ? Il2Cpp::g_api.array_new(g_ObjectKlass, 1) : nullptr;
-        if (SafeMem::IsPlausiblePtr(boxed) && SafeMem::IsPlausiblePtr(objArr)) {
-            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(objArr) + 0x20) = boxed;
-            void* invArgs[2] = { client, objArr };
-            exc = nullptr;
-            Il2Cpp::g_api.runtime_invoke(g_MethodBaseInvoke, mObj, invArgs, &exc);
-            ok = (exc == nullptr);
-        }
-    });
-    return ok;
+    // Fallback to raw HostCommandWriter.WriteSend when AOT generic MakeGenericMethod/Invoke is unavailable
+    return SendDatagramRawWire(client, e, box, payloadSize);
 }
 
 inline bool SendDatagram(const char* ns, const char* dgramName, const void* payload, size_t payloadSize) {
@@ -305,7 +622,7 @@ inline bool SendComboHit(int32_t targetId, int32_t targetGen, bool isKo, uint64_
     r.isKo       = isKo ? 1 : 0;
     r.timestamp  = ts;
     g_MeleeOwnFlag.store(1, std::memory_order_release);
-    bool ok = SendDatagram("dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Datagrams",
+    bool ok = SendDatagram(Offsets::g_cfg.nsWeaponDatagrams.c_str(),
                            "MeleeWeaponAttackRequestDatagram", &r, sizeof(r));
     g_MeleeOwnFlag.store(0, std::memory_order_release);
     return ok;
@@ -341,7 +658,7 @@ inline bool SendOneHitRaw(int32_t targetId, int32_t targetGen, const float* dir)
     m.attackType      = 2;
     m.isKo            = 1;
     m.timestamp       = ComboTimestamp();
-    return SendDatagram("dev.Scripts.ECS.Morpeh.Features.WeaponFeature.Datagrams",
+    return SendDatagram(Offsets::g_cfg.nsWeaponDatagrams.c_str(),
                         "MeleeWeaponAttackDatagram", &m, sizeof(m));
 }
 
@@ -352,7 +669,7 @@ inline bool SendDisplacement(const Vec3& at, double remoteTime) {
     d.rot[3] = 1.0f;
     d.remoteTime = remoteTime;
     d.isClose    = 1;
-    return SendDatagram("dev.Scripts.Networking.IBNet.IBNet_Datagrams.ElementSync",
+    return SendDatagram(Offsets::g_cfg.nsIBNetElemSync.c_str(),
                         "PedDisplacementSyncDatagram", &d, sizeof(d));
 }
 
@@ -431,19 +748,19 @@ inline Vec3 StandPos(const Vec3& me, const Vec3& tgt, float offset) {
 
 inline void GhostTo(const Vec3& tgt, const Vec3& me) {
     Vec3 dest = StandPos(me, tgt, 0.45f);
-    double base = g_LastRemoteTime > 0.0 ? g_LastRemoteTime : (GetMonotonicMs() / 1000.0);
-    base += 0.025;
-    g_LastRemoteTime = base;
-    SendDisplacement(dest, base);
+    if (g_LastRemoteTime.load(std::memory_order_acquire) <= 1000.0) {
+        SyncServerTimeFallback(ClientForSend());
+    }
+    double rt = AdvanceRemoteTime(0.025);
+    SendDisplacement(dest, rt);
     g_kaHasActiveGhost = true;
     g_GhostHoldUntil = GetMonotonicMs() + 200;
 }
 
 inline void GhostRestore(const Vec3& me) {
     if (!g_kaHasActiveGhost) return;
-    double base = g_LastRemoteTime + 0.025;
-    g_LastRemoteTime = base;
-    SendDisplacement(me, base);
+    double rt = AdvanceRemoteTime(0.025);
+    SendDisplacement(me, rt);
     g_kaHasActiveGhost = false;
 }
 
@@ -497,7 +814,6 @@ inline bool EnsureLocalIdCached() {
 }
 
 // Syncs streamed Morpeh players into g_Elems + g_ElemNames on UnityMain (~6.5Hz)
-// Guarantees targets & nicknames stay fresh on iOS even alongside network Read hooks.
 inline void SyncStreamedRosterOnGameThread(int64_t now) {
     static int64_t s_lastSyncMs = 0;
     if (now - s_lastSyncMs < 150) return;
@@ -526,12 +842,55 @@ inline void SyncStreamedRosterOnGameThread(int64_t now) {
         t.pos = pl.worldPos;
         t.gen = eid.Gen > 0 ? eid.Gen : 1;
         t.seenMs = now;
-        if (pl.health <= 0 && t.deadUntilMs < now + 3000) {
+        bool isDeadTag = (Morpeh::g_stashes.pedDeadTag && Morpeh::HasTag(Morpeh::g_stashes.pedDeadTag, pl.entityId));
+        if ((pl.health <= 0 || isDeadTag) && t.deadUntilMs < now + 3000) {
             t.deadUntilMs = now + 3000;
         }
         if (!pl.name.empty()) {
             g_ElemNames[eid.Id] = pl.name;
         }
+    }
+}
+
+// ---------------- Lock-free HWBP Capture Helpers (NO mutexes, NO IL2CPP calls) ----------------
+inline void OnPedDispWriteLockFree(uint64_t x0) {
+    if (x0 < 0x100000000ULL) return;
+    void* ptr = reinterpret_cast<void*>(x0);
+    DisplacementDatagram d{};
+    if (!SafeMem::ReadVal(ptr, d)) return;
+    void* dispCls = g_clsPedDispAtomic.load(std::memory_order_acquire);
+    if (dispCls && SafeMem::PtrAt(ptr, 0) == dispCls) {
+        if (!SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(ptr) + 0x10, d)) return;
+    }
+    if (d.remoteId.Id >= 1 && d.remoteId.Gen >= 1 && d.remoteId.Gen <= 1000000 &&
+        std::isfinite(d.remoteTime) && d.remoteTime > 1000.0 && d.remoteTime < 1e9) {
+        g_LocalId.store(d.remoteId.Id, std::memory_order_release);
+        g_LocalGen.store(d.remoteId.Gen, std::memory_order_release);
+        RecordRemoteTime(d.remoteTime);
+        g_DispHits.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void OnMeleeReqWriteLockFree(uint64_t x0) {
+    if (x0 < 0x100000000ULL) return;
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(x0);
+    void* reqCls = g_clsMeleeReqAtomic.load(std::memory_order_acquire);
+    if (reqCls && SafeMem::PtrAt(ptr, 0) == reqCls) {
+        ptr += 0x10;
+    }
+    RequestDatagram r{};
+    if (!SafeMem::ReadVal(ptr, r)) return;
+    g_WriteHits.fetch_add(1, std::memory_order_relaxed);
+    if (r.element.Id >= 1 && r.element.Gen >= 1 && r.element.Gen <= 1000000) {
+        g_LocalId.store(r.element.Id, std::memory_order_release);
+        g_LocalGen.store(r.element.Gen, std::memory_order_release);
+    }
+    if (!g_cfgState.bMasterDisable && g_cfgState.bKillAroundOneHit &&
+        g_MeleeOwnFlag.load(std::memory_order_relaxed) == 0 &&
+        (g_cfgState.bKillAroundAutoRepeat || g_cfgState.bKillAroundAura ||
+         g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0)) {
+        uint8_t ko = 1;
+        SafeMem::Write(ptr + offsetof(RequestDatagram, isKo), &ko, 1);
     }
 }
 
@@ -560,7 +919,7 @@ inline int32_t PredictComboDamageOverride(int32_t /*attackType*/, bool isStamina
     if (isStaminaDamage || g_cfgState.bMasterDisable) return 0;
     bool active = g_cfgState.bKillAroundOneHit &&
                   (g_cfgState.bKillAroundAutoRepeat || g_cfgState.bKillAroundAura ||
-                   g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > GetMonotonicMs());
+                   g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0);
     if (active) {
         outOverride = true;
         return kOneHitDamage;
@@ -576,9 +935,7 @@ inline void OnPedDisplacementRead(const void* rawPkt) {
     Vec3 p{ d.pos[0], d.pos[1], d.pos[2] };
     if (!IsFiniteVec3(p)) return;
     g_DispHits.fetch_add(1, std::memory_order_relaxed);
-    if (std::isfinite(d.remoteTime) && d.remoteTime > g_LastRemoteTime) {
-        g_LastRemoteTime = d.remoteTime;
-    }
+    RecordRemoteTime(d.remoteTime);
     const int64_t now = GetMonotonicMs();
     std::lock_guard<std::mutex> lk(g_Mtx);
     Tracked& t = g_Elems[d.remoteId.Id];
@@ -652,9 +1009,103 @@ inline void OnMeleeAttackWrite(void* rawPkt, void* /*writer*/ = nullptr) {
     }
 }
 
+// Reads EntityMetaDatagramHandler._items -> NetworkFilter<T> without relying on AOT virtual Read hooks
+inline void SyncNetworkFiltersOnGameThread() {
+    static int64_t  s_lastPollMs   = 0;
+    static bool     s_idsResolved  = false;
+    static uint64_t s_pktDisp      = 0;
+    static uint64_t s_pktDead      = 0;
+    static uint64_t s_pktMeleeAtk  = 0;
+    static uint64_t s_lastMeleeTs  = 0;
+    static int32_t  s_lastDeadSeen = 0;
+
+    const int64_t now = GetMonotonicMs();
+    if (now - s_lastPollMs < 60) return;
+    s_lastPollMs = now;
+
+    void* client = ClientForSend();
+    if (!Il2Cpp::IsUnityObjectSafe(client) || !EnsureWireCtxReady()) return;
+
+    if (!s_idsResolved) {
+        s_idsResolved = true;
+        uint8_t ch = 0;
+        if (void* k = Il2Cpp::FindClass(Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram"))
+            LookupMetaTypeInfo(k, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", s_pktDisp, ch);
+        if (void* k = Il2Cpp::FindClass(Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram"))
+            LookupMetaTypeInfo(k, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram", s_pktDead, ch);
+        if (void* k = Il2Cpp::FindClass(Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram"))
+            LookupMetaTypeInfo(k, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", s_pktMeleeAtk, ch);
+    }
+
+    void* handler = SafeMem::PtrAt(client, g_Wire.offMcHandler);
+    if (!Il2Cpp::IsUnityObjectSafe(handler)) return;
+    void* dict = SafeMem::PtrAt(handler, 0x10); // EntityMetaDatagramHandler._items
+    if (!Il2Cpp::IsUnityObjectSafe(dict)) return;
+
+    void* dictK = Il2Cpp::g_api.object_get_class ? Il2Cpp::g_api.object_get_class(dict) : nullptr;
+    size_t offEntries = Il2Cpp::FieldOffset(dictK, "_entries", 0x18);
+    size_t offCount   = Il2Cpp::FieldOffset(dictK, "_count", 0x20);
+    void* entriesArr  = SafeMem::PtrAt(dict, offEntries);
+    int32_t count     = 0;
+    SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(dict) + offCount, count);
+    if (!Il2Cpp::IsUnityObjectSafe(entriesArr) || count <= 0 || count > 1024) return;
+
+    int32_t arrLen = 0;
+    SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(entriesArr) + 0x18, arrLen);
+    const int32_t limit = std::min(count, arrLen);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(entriesArr) + 0x20;
+
+    for (int32_t i = 0; i < limit; ++i) {
+        const uint8_t* ent = base + static_cast<size_t>(i) * 24ULL;
+        int32_t hc = -1;
+        uint64_t key = 0;
+        void* itemObj = nullptr;
+        SafeMem::ReadVal(ent, hc);
+        if (hc < 0) continue;
+        SafeMem::ReadVal(ent + 0x08, key);
+        SafeMem::ReadVal(ent + 0x10, itemObj);
+        if (!Il2Cpp::IsUnityObjectSafe(itemObj)) continue;
+
+        if (key != s_pktDisp && key != s_pktDead && key != s_pktMeleeAtk) continue;
+        void* filterObj = SafeMem::PtrAt(itemObj, 0x18); // EntityMetaDatagramHandlerItem<T>._filter
+        if (!Il2Cpp::IsUnityObjectSafe(filterObj)) continue;
+
+        void* arr = SafeMem::PtrAt(filterObj, 0x10);
+        int32_t fCount = 0;
+        SafeMem::ReadVal(reinterpret_cast<const uint8_t*>(filterObj) + 0x18, fCount);
+        if (!Il2Cpp::IsUnityObjectSafe(arr) || fCount <= 0 || fCount > 64) continue;
+
+        const uint8_t* fBase = reinterpret_cast<const uint8_t*>(arr) + 0x20;
+        if (key == s_pktDisp) {
+            for (int32_t j = 0; j < fCount; ++j) {
+                OnPedDisplacementRead(fBase + static_cast<size_t>(j) * sizeof(DisplacementDatagram));
+            }
+        } else if (key == s_pktDead) {
+            for (int32_t j = 0; j < fCount; ++j) {
+                const uint8_t* pd = fBase + static_cast<size_t>(j) * 0x50ULL;
+                int32_t deadId = 0;
+                if (SafeMem::ReadVal(pd, deadId) && deadId >= 1 && deadId != s_lastDeadSeen) {
+                    s_lastDeadSeen = deadId;
+                    OnPedDeadRead(pd);
+                }
+            }
+        } else if (key == s_pktMeleeAtk) {
+            for (int32_t j = 0; j < fCount; ++j) {
+                MeleeHitDatagram mh{};
+                const uint8_t* mp = fBase + static_cast<size_t>(j) * sizeof(MeleeHitDatagram);
+                if (SafeMem::ReadVal(mp, mh) && mh.timestamp != s_lastMeleeTs) {
+                    s_lastMeleeTs = mh.timestamp;
+                    OnMeleeAttackRead(mp);
+                }
+            }
+        }
+    }
+}
+
 // ---------------- UnityMain Tick (exact kill_around (2).h) ----------------
 inline void Tick() {
     const int64_t tNow = GetMonotonicMs();
+    PrecacheDatagramClassesOnce();
 
     // Refresh cached local position at 4 Hz for the menu (menu never touches engine)
     if (tNow - g_LocalPosMs >= 250) {
@@ -666,6 +1117,11 @@ inline void Tick() {
         g_LocalPosCache = p;
     }
 
+    // Keep client + server time + datagram filters alive
+    if (void* client = ClientForSend()) {
+        SyncServerTimeFallback(client);
+    }
+
     // Keep streamed roster + nicknames synced when menu KillAround tab is visible or KillAround is active
     const bool menuViewingKa = g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
                                g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
@@ -673,6 +1129,7 @@ inline void Tick() {
     const bool burstNow = g_kaKillAllBurstUntilMs.load(std::memory_order_acquire) > tNow;
     if (menuViewingKa || g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat || burstNow) {
         SyncStreamedRosterOnGameThread(tNow);
+        SyncNetworkFiltersOnGameThread();
     }
 
     // New local ped = relog / respawn into new world -> reset active session safely
@@ -804,6 +1261,18 @@ inline void DrawPanel(float availW) {
                 g_LocalId.load(std::memory_order_relaxed),
                 g_LocalGen.load(std::memory_order_relaxed),
                 g_AcceptedHits.load(std::memory_order_relaxed));
+
+    const bool hasClient = Il2Cpp::IsUnityObjectSafe(g_KaClient) ||
+                           Il2Cpp::IsUnityObjectSafe(g_metaClient.load(std::memory_order_relaxed));
+    const int txMode = g_TxMode.load(std::memory_order_relaxed);
+    const char* txTag = (txMode == 2) ? "Wire" : (txMode == 1 ? "Gen" : "-");
+    ImGui::TextDisabled("Net:%s | Sync:%s | Tx:%d/%d(%s) | Disp:%d",
+                        hasClient ? "OK" : "Wait",
+                        g_LastRemoteTime.load(std::memory_order_relaxed) > 1000.0 ? "OK" : "0",
+                        g_SendOk.load(std::memory_order_relaxed),
+                        g_SendFail.load(std::memory_order_relaxed),
+                        txTag,
+                        g_DispHits.load(std::memory_order_relaxed));
 
     if (g_LocalId.load(std::memory_order_relaxed) < 1) {
         ImGui::TextColored(ImVec4(1.00f, 0.80f, 0.20f, 1.00f), "%s",
