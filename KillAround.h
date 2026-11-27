@@ -842,8 +842,7 @@ inline void SyncStreamedRosterOnGameThread(int64_t now) {
         t.pos = pl.worldPos;
         t.gen = eid.Gen > 0 ? eid.Gen : 1;
         t.seenMs = now;
-        bool isDeadTag = (Morpeh::g_stashes.pedDeadTag && Morpeh::HasTag(Morpeh::g_stashes.pedDeadTag, pl.entityId));
-        if ((pl.health <= 0 || isDeadTag) && t.deadUntilMs < now + 3000) {
+        if ((pl.dead || pl.health <= 0) && t.deadUntilMs < now + 3000) {
             t.deadUntilMs = now + 3000;
         }
         if (!pl.name.empty()) {
