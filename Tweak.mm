@@ -59,43 +59,16 @@ static OneStateGlassOverlay* g_overlay = nil;
 
 @implementation ImGuiTouchSinkView {
     CGPoint _touchPos;
-    CGPoint _touchStartPos;
-    CGPoint _prevTouchPos;
     BOOL    _hasTouchPos;
     BOOL    _touchDown;
     BOOL    _latchedDown;
     BOOL    _latchedUp;
-    BOOL    _isSwipeScrolling;
-    float   _pendingWheelY;
-    float   _scrollInertiaY;
 }
 - (void)flushToImGui {
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
     if (_hasTouchPos) {
         io.AddMousePosEvent((float)_touchPos.x, (float)_touchPos.y);
-    }
-
-    // Native iPhone vertical touch-swipe scrolling + smooth momentum inertia
-    float wheelToSend = 0.0f;
-    if (std::fabs(_pendingWheelY) > 0.001f) {
-        wheelToSend = _pendingWheelY;
-        _pendingWheelY = 0.0f;
-    } else if (!_touchDown && std::fabs(_scrollInertiaY) > 0.015f) {
-        wheelToSend = _scrollInertiaY;
-        _scrollInertiaY *= 0.86f;
-        if (std::fabs(_scrollInertiaY) <= 0.015f) _scrollInertiaY = 0.0f;
-    }
-    if (std::fabs(wheelToSend) > 0.001f) {
-        io.AddMouseWheelEvent(0.0f, wheelToSend);
-    }
-
-    if (_isSwipeScrolling) {
-        // Never trigger accidental toggle taps while finger is scrolling the list
-        io.AddMouseButtonEvent(0, false);
-        _latchedDown = NO;
-        _latchedUp = NO;
-        return;
     }
 
     if (_latchedDown) {
@@ -113,39 +86,18 @@ static OneStateGlassOverlay* g_overlay = nil;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
     _touchPos = p;
-    _touchStartPos = p;
-    _prevTouchPos = p;
     _hasTouchPos = YES;
     _touchDown = YES;
     _latchedDown = YES;
     _latchedUp = NO;
-    _isSwipeScrolling = NO;
-    _pendingWheelY = 0.0f;
-    _scrollInertiaY = 0.0f;
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
     if (!touch) return;
     CGPoint p = [touch locationInView:self];
-    CGFloat stepDy = p.y - _prevTouchPos.y;
-    CGFloat totalDx = p.x - _touchStartPos.x;
-    CGFloat totalDy = p.y - _touchStartPos.y;
-    _prevTouchPos = p;
     _touchPos = p;
     _hasTouchPos = YES;
     _touchDown = YES;
-
-    // Detect intentional vertical finger swipe -> smooth native iOS scrolling (never steals horizontal sliders!)
-    if (!ThemeEngine::g_sliderDragging) {
-        if (!_isSwipeScrolling && std::fabs((double)totalDy) > 9.0 && std::fabs((double)totalDy) > std::fabs((double)totalDx) * 1.15) {
-            _isSwipeScrolling = YES;
-        }
-        if (_isSwipeScrolling) {
-            float wheelStep = static_cast<float>(stepDy) * 0.085f;
-            _pendingWheelY += wheelStep;
-            _scrollInertiaY = _scrollInertiaY * 0.55f + wheelStep * 0.45f;
-        }
-    }
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     UITouch* touch = t.anyObject;
@@ -154,16 +106,10 @@ static OneStateGlassOverlay* g_overlay = nil;
         _hasTouchPos = YES;
     }
     _touchDown = NO;
-    if (_isSwipeScrolling) {
-        _isSwipeScrolling = NO;
-        _latchedUp = NO;
-    } else {
-        _latchedUp = YES;
-    }
+    _latchedUp = YES;
 }
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e {
     _touchDown = NO;
-    _isSwipeScrolling = NO;
     _latchedUp = YES;
 }
 @end
@@ -542,7 +488,7 @@ static OneStateGlassOverlay* g_overlay = nil;
     } else if (srchAct == 2) {
         _searchBuf[0] = '\0';
     }
-    ImGui::BeginChild(tag, ImVec2(0, 185), true);
+    ImGui::BeginChild(tag, ImVec2(0, 185), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
     for (int i = 0; i < count; ++i) {
         if (!ThemeEngine::CaseInsensitiveContains(items[i].name, _searchBuf)) continue;
         char row[128];
@@ -567,7 +513,7 @@ static OneStateGlassOverlay* g_overlay = nil;
     } else if (srchAct == 2) {
         _searchBuf[0] = '\0';
     }
-    ImGui::BeginChild(tag, ImVec2(0, 185), true);
+    ImGui::BeginChild(tag, ImVec2(0, 185), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
     for (int i = 0; i < count; ++i) {
         if (!ThemeEngine::CaseInsensitiveContains(items[i].name, _searchBuf)) continue;
         char row[128];
@@ -708,7 +654,7 @@ static OneStateGlassOverlay* g_overlay = nil;
     // Main Scrollable Body below Sub-Tab Bar
     float bodyH = winH - 74.0f;
     ImGui::SetCursorScreenPos(ImVec2(contentX, wp.y + 62.0f));
-    ImGui::BeginChild("##MainBody", ImVec2(contentW, bodyH), false);
+    ImGui::BeginChild("##MainBody", ImVec2(contentW, bodyH), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
     // ========================================================================
     // TAB 0: COMBAT (Crosshair Icon)
@@ -881,7 +827,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                 ImGui::TextDisabled("%s", T("Scanning server players... join world first.",
                                             "جاري مسح لاعبي السيرفر... ادخل العالم أولاً."));
             } else {
-                ImGui::BeginChild("##spec_list", ImVec2(0, 0), true);
+                ImGui::BeginChild("##spec_list", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 int matchCount = 0;
                 for (const auto& sp : serverList) {
                     char idStr[32];
@@ -1123,7 +1069,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                     Features::ApplyEmoteLocal((int32_t)e.id);
                 }];
             } else {
-                ImGui::BeginChild("##weaps_l", ImVec2(0, 195), true);
+                ImGui::BeginChild("##weaps_l", ImVec2(0, 195), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 for (int i = 0; i < Catalogs::kWeaponCount; ++i) {
                     char wb[96];
                     snprintf(wb, sizeof(wb), "%s (%s) [#%lld]", Catalogs::kWeapons[i].displayName, Catalogs::kWeapons[i].internalName, (long long)Catalogs::kWeapons[i].id);
@@ -1204,7 +1150,7 @@ static OneStateGlassOverlay* g_overlay = nil;
                 ImGui::TextDisabled("%s", T("Scanning server players... join world to populate list.",
                                             "جاري مسح لاعبي السيرفر... ادخل العالم لتحديث القائمة."));
             } else {
-                ImGui::BeginChild("##pl_scroll", ImVec2(0, 0), true);
+                ImGui::BeginChild("##pl_scroll", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 for (const auto& sp : serverList) {
                     if (_playerSearchBuf[0] != '\0') {
                         char idStr[32];
@@ -1308,6 +1254,7 @@ static OneStateGlassOverlay* g_overlay = nil;
         }
     }
 
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
     ImGui::EndChild();
     ImGui::End();
 }

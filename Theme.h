@@ -152,7 +152,7 @@ inline void ApplyProStyle() {
     st.ChildRounding     = 12.0f;
     st.FrameRounding     = 9.0f;
     st.PopupRounding     = 12.0f;
-    st.ScrollbarRounding = 8.0f;
+    st.ScrollbarRounding = 12.0f;
     st.GrabRounding      = 8.0f;
     st.WindowBorderSize  = 0.0f;
     st.ChildBorderSize   = 0.0f;
@@ -160,7 +160,7 @@ inline void ApplyProStyle() {
     st.WindowPadding     = ImVec2(0.0f, 0.0f);
     st.ItemSpacing       = ImVec2(8.0f, 8.0f);
     st.FramePadding      = ImVec2(10.0f, 6.0f);
-    st.ScrollbarSize     = 16.0f; // Wide finger-friendly iOS scrollbar thumb
+    st.ScrollbarSize     = 26.0f; // Extra-wide comfortable thumb scrollbar for iPhone (touch-swipe disabled)
 
     ImVec4 acc    = HsvToVec4(g_state.hue, g_state.sat, g_state.val, 1.0f);
     ImVec4 accDim = HsvToVec4(g_state.hue, g_state.sat, g_state.val * 0.85f, 0.38f);
@@ -184,9 +184,9 @@ inline void ApplyProStyle() {
     c[ImGuiCol_CheckMark]       = acc;
     c[ImGuiCol_Text]            = ImVec4(246/255.f, 248/255.f, 252/255.f, 1.0f);
     c[ImGuiCol_TextDisabled]    = ImVec4(146/255.f, 154/255.f, 172/255.f, 1.0f);
-    c[ImGuiCol_ScrollbarBg]     = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
-    c[ImGuiCol_ScrollbarGrab]   = ImVec4(1.0f, 1.0f, 1.0f, 0.38f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(acc.x, acc.y, acc.z, 0.78f);
+    c[ImGuiCol_ScrollbarBg]     = ImVec4(1.0f, 1.0f, 1.0f, 0.11f);
+    c[ImGuiCol_ScrollbarGrab]   = ImVec4(acc.x * 0.55f + 0.35f, acc.y * 0.55f + 0.35f, acc.z * 0.55f + 0.35f, 0.78f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(acc.x, acc.y, acc.z, 0.92f);
     c[ImGuiCol_ScrollbarGrabActive]  = acc;
 }
 

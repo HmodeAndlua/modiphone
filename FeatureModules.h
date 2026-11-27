@@ -41,6 +41,8 @@ using VoiceSetAllMutedFn  = void (*)(void*, bool, void*);
 using WaterTriggerFn      = void (*)(void*, void*, void*);
 using CharActorSimFn      = void (*)(void*, float, void*);
 using PedStateCanEnterFn  = bool (*)(void*, const void*, int32_t, int32_t, void*);
+using MetaPollFn          = void (*)(void*, void*);
+using PredictComboDmgFn   = int32_t (*)(void*, int32_t, bool, void*);
 
 inline SystemUpdateFn    orig_GZ_Sync = nullptr, orig_GZ_Fire = nullptr, orig_GZ_Melee = nullptr;
 inline FallDmgFn         orig_ApplyLocalFallDamage = nullptr;
@@ -72,9 +74,11 @@ inline SystemUpdateFn      orig_PedOxygenUpdate = nullptr, orig_PedGravityUpdate
 inline SystemUpdateFn      orig_PedKoWaterUpdate = nullptr, orig_SubmergeUpdate = nullptr;
 inline SystemUpdateFn      orig_UnderwaterReactUpdate = nullptr;
 inline WaterTriggerFn      orig_WaterAreaTriggerStay = nullptr;
-inline WriteDatagramFn     orig_PedDispRead = nullptr, orig_PedDispWrite = nullptr;
-inline WriteDatagramFn     orig_PedDeadRead = nullptr, orig_MeleeAtkRead = nullptr, orig_MeleeReqWrite = nullptr;
+inline WriteDatagramFn     orig_PedDispRead = nullptr, orig_PedDispWrite = nullptr, orig_VehDispRead = nullptr;
+inline WriteDatagramFn     orig_PedDeadRead = nullptr, orig_MeleeAtkRead = nullptr, orig_MeleeAtkWrite = nullptr, orig_MeleeReqWrite = nullptr;
 inline SystemUpdateFn      orig_WeaponProduceMeleeUpdate = nullptr, orig_ElemSendDispUpdate = nullptr;
+inline MetaPollFn          orig_MetaPoll = nullptr;
+inline PredictComboDmgFn   orig_PredictComboDamage = nullptr;
 // LADRRAZAsrc AirWalk (CharacterActor) + Anti-Taser & Anti-Faint (Knockout / LoseConsciousness)
 inline CharActorSimFn      orig_CharActor_PreSim = nullptr, orig_CharActor_PostSim = nullptr;
 inline PedStateCanEnterFn  orig_FallState_CanEnter[7]{};
@@ -1016,31 +1020,58 @@ static void Hook_SkipLoseConscUpdate(void* self, float dt, void* method) {
     if (orig_SkipLoseConscUpdate) orig_SkipLoseConscUpdate(self, dt, method);
 }
 
-// KillAround Datagram hooks (unbox-normalized so orig_* unboxed struct methods always receive T*)
+// KillAround Datagram, Client & Melee Hooks (unbox-normalized so orig_* unboxed struct methods always receive T*)
 static void Hook_PedDispRead(void* self, void* reader, void* method) {
     void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
-    if (orig_PedDispRead) orig_PedDispRead(unboxed ? unboxed : self, reader, method);
-    KillAround::OnPedDisplacementRead(unboxed ? unboxed : self);
+    void* ptr = unboxed ? unboxed : self;
+    if (orig_PedDispRead) orig_PedDispRead(ptr, reader, method);
+    KillAround::OnPedDisplacementRead(ptr);
+}
+static void Hook_VehDispRead(void* self, void* reader, void* method) {
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsVehDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "VehicleDisplacementSyncDatagram");
+    void* ptr = unboxed ? unboxed : self;
+    if (orig_VehDispRead) orig_VehDispRead(ptr, reader, method);
+    KillAround::OnVehicleDisplacementRead(ptr);
 }
 static void Hook_PedDispWrite(void* self, void* writer, void* method) {
     void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDisp, Offsets::g_cfg.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram");
-    KillAround::OnPedDisplacementWrite(unboxed ? unboxed : self, writer);
-    if (orig_PedDispWrite) orig_PedDispWrite(unboxed ? unboxed : self, writer, method);
+    void* ptr = unboxed ? unboxed : self;
+    KillAround::OnPedDisplacementWrite(ptr, writer);
+    if (orig_PedDispWrite) orig_PedDispWrite(ptr, writer, method);
 }
 static void Hook_PedDeadRead(void* self, void* reader, void* method) {
     void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsPedDead, Offsets::g_cfg.nsIBNetPedSync.c_str(), "PedDeadDatagram");
-    if (orig_PedDeadRead) orig_PedDeadRead(unboxed ? unboxed : self, reader, method);
-    KillAround::OnPedDeadRead(unboxed ? unboxed : self);
+    void* ptr = unboxed ? unboxed : self;
+    if (orig_PedDeadRead) orig_PedDeadRead(ptr, reader, method);
+    KillAround::OnPedDeadRead(ptr);
 }
 static void Hook_MeleeAtkRead(void* self, void* reader, void* method) {
     void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
-    if (orig_MeleeAtkRead) orig_MeleeAtkRead(unboxed ? unboxed : self, reader, method);
-    KillAround::OnMeleeAttackRead(unboxed ? unboxed : self);
+    void* ptr = unboxed ? unboxed : self;
+    if (orig_MeleeAtkRead) orig_MeleeAtkRead(ptr, reader, method);
+    KillAround::OnMeleeAttackRead(ptr);
+}
+static void Hook_MeleeAtkWrite(void* self, void* writer, void* method) {
+    void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeAtk, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram");
+    void* ptr = unboxed ? unboxed : self;
+    KillAround::OnMeleeAttackWrite(ptr, writer);
+    if (orig_MeleeAtkWrite) orig_MeleeAtkWrite(ptr, writer, method);
 }
 static void Hook_MeleeReqWrite(void* self, void* writer, void* method) {
     void* unboxed = KillAround::NormalizeDatagramPtrMut(self, KillAround::g_kaClsMeleeReq, Offsets::g_cfg.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram");
-    KillAround::OnMeleeRequestWrite(unboxed ? unboxed : self, writer);
-    if (orig_MeleeReqWrite) orig_MeleeReqWrite(unboxed ? unboxed : self, writer, method);
+    void* ptr = unboxed ? unboxed : self;
+    KillAround::OnMeleeRequestWrite(ptr, writer);
+    if (orig_MeleeReqWrite) orig_MeleeReqWrite(ptr, writer, method);
+}
+static void Hook_MetaPoll(void* self, void* method) {
+    KillAround::OnMetaClientPoll(self);
+    if (orig_MetaPoll) orig_MetaPoll(self, method);
+}
+static int32_t Hook_PredictComboDamage(void* self, int32_t attackType, bool isStaminaDamage, void* method) {
+    bool didOverride = false;
+    int32_t dmg = KillAround::PredictComboDamageOverride(attackType, isStaminaDamage, didOverride);
+    if (didOverride) return dmg;
+    return orig_PredictComboDamage ? orig_PredictComboDamage(self, attackType, isStaminaDamage, method) : 0;
 }
 static void Hook_WeaponProduceMeleeUpdate(void* self, float dt, void* method) {
     if (SafeMem::IsPlausiblePtr(self))
@@ -1353,24 +1384,25 @@ inline void InstallLazyFeatureHooks() {
             Il2Cpp::SwapMethodPointer(m, (void*)Hook_WeaponProduceMeleeUpdate, (void**)&orig_WeaponProduceMeleeUpdate);
         if (void* m = Il2Cpp::ResolveMethod(c.nsElementsSys.c_str(), "ElementSendDisplacementSystem", "OnUpdate", 1))
             Il2Cpp::SwapMethodPointer(m, (void*)Hook_ElemSendDispUpdate, (void**)&orig_ElemSendDispUpdate);
+        if (void* m = Il2Cpp::ResolveMethod(c.nsFlakeFlow.c_str(), c.clsMetaClientWrapper.c_str(), "Poll", 0))
+            Il2Cpp::SwapMethodPointer(m, (void*)Hook_MetaPoll, (void**)&orig_MetaPoll);
+        if (void* m = Il2Cpp::ResolveMethod(c.nsWeaponSys.c_str(), "WeaponProduceAttackMeleeSystem", "PredictComboDamage", 2))
+            Il2Cpp::SwapMethodPointer(m, (void*)Hook_PredictComboDamage, (void**)&orig_PredictComboDamage);
     }
-    bool wantKillAround = g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
-                          KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
-                          KillAround::g_kaPendingKillElemId.load(std::memory_order_relaxed) > 0 ||
-                          KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed) > 0 ||
-                          (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
-                           g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
-                           g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3);
-    if (wantKillAround && !g_killAroundHooksInstalled && Morpeh::g_stashes.worldReady) {
+    if (!g_killAroundHooksInstalled && Morpeh::g_stashes.worldReady) {
         g_killAroundHooksInstalled = true;
         Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Read", 1,
                                   (void*)Hook_PedDispRead, (void**)&orig_PedDispRead);
         Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "PedDisplacementSyncDatagram", "Write", 1,
                                   (void*)Hook_PedDispWrite, (void**)&orig_PedDispWrite);
+        Il2Cpp::SwapVirtualMethod(c.nsIBNetElemSync.c_str(), "VehicleDisplacementSyncDatagram", "Read", 1,
+                                  (void*)Hook_VehDispRead, (void**)&orig_VehDispRead);
         Il2Cpp::SwapVirtualMethod(c.nsIBNetPedSync.c_str(), "PedDeadDatagram", "Read", 1,
                                   (void*)Hook_PedDeadRead, (void**)&orig_PedDeadRead);
         Il2Cpp::SwapVirtualMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", "Read", 1,
                                   (void*)Hook_MeleeAtkRead, (void**)&orig_MeleeAtkRead);
+        Il2Cpp::SwapVirtualMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackDatagram", "Write", 1,
+                                  (void*)Hook_MeleeAtkWrite, (void**)&orig_MeleeAtkWrite);
         Il2Cpp::SwapVirtualMethod(c.nsWeaponDatagrams.c_str(), "MeleeWeaponAttackRequestDatagram", "Write", 1,
                                   (void*)Hook_MeleeReqWrite, (void**)&orig_MeleeReqWrite);
     }
@@ -3911,6 +3943,7 @@ inline void RefreshWorldSnapshot(float dt) {
     // Populate ESP / Aimbot / Spectate / KillAround / Player-List Snapshot
     bool killAroundActive = g_cfgState.bKillAroundAura || g_cfgState.bKillAroundAutoRepeat ||
                             KillAround::g_kaPendingKillAllReq.load(std::memory_order_relaxed) ||
+                            KillAround::g_kaPendingKillElemId.load(std::memory_order_relaxed) > 0 ||
                             KillAround::g_kaSeqUiActive.load(std::memory_order_relaxed) ||
                             (KillAround::GetMonotonicMs() < KillAround::g_kaKillAllBurstUntilMs.load(std::memory_order_relaxed)) ||
                             (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
@@ -4910,6 +4943,7 @@ inline void TickRuntime() {
         KillAround::g_kaPendingKillElemId.load(std::memory_order_relaxed) > 0 ||
         KillAround::g_kaPendingRestoreGhost.load(std::memory_order_relaxed) ||
         KillAround::g_kaHasActiveGhost || KillAround::g_kaStepActive || KillAround::g_kaCombatActive ||
+        KillAround::g_kaHasGhostOrigin ||
         (g_menuIsOpenAtomic.load(std::memory_order_relaxed) &&
          g_activeTabAtomic.load(std::memory_order_relaxed) == 0 &&
          g_activeSubTabAtomic.load(std::memory_order_relaxed) == 3)) {

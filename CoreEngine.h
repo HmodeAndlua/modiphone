@@ -413,14 +413,15 @@ struct RuntimeSettings {
     bool bAutoMapMarkerTp    = false;
 
     // Kill Around & Single-Target Melee Finisher
-    bool bKillAroundAutoRepeat = false;
-    bool bKillAroundAura       = false;
-    bool bKillAroundGhostStep  = true;
-    bool bKillAroundMicroStep  = false;
-    bool bKillAroundIncludeNpcs= false;
-    bool bKillAroundOneHit     = true;
-    bool bKillAroundFilterNear = false;
-    float killAroundRadius     = 35.0f;
+    bool bKillAroundAutoRepeat     = false;
+    bool bKillAroundAura           = false;
+    bool bKillAroundGhostStep      = true;
+    bool bKillAroundMicroStep      = false;
+    bool bKillAroundIncludeNpcs    = false;
+    bool bKillAroundIncludeVehicles= true;
+    bool bKillAroundOneHit         = true;
+    bool bKillAroundFilterNear     = false;
+    float killAroundRadius         = 65.0f;
     bool bNickBypass         = false;
     bool bVoiceGuard         = false;
     bool bDeviceIdSpoof      = false;
@@ -815,11 +816,12 @@ inline bool SwapVirtualMethod(const char* nsName, const char* clsName, const cha
     if (outOrig) *outOrig = orig;
 
     bool patchedMethod = SafeMem::Write(methodInfo, &replacement, sizeof(void*));
+    bool isValType = (g_api.class_is_valuetype && g_api.class_is_valuetype(klass));
     uint8_t* kBase = reinterpret_cast<uint8_t*>(klass);
     for (size_t off = 0x100; off < 0x3800; off += sizeof(void*)) {
         void* pair[2]{};
         if (!SafeMem::Read(kBase + off, pair, sizeof(pair))) break;
-        if (pair[0] == orig && pair[1] == methodInfo) {
+        if (pair[1] == methodInfo && (pair[0] == orig || isValType)) {
             SafeMem::Write(kBase + off, &replacement, sizeof(void*));
         }
     }
@@ -1863,6 +1865,11 @@ inline void DiscoverInitializerAndServices() {
 
 // On-demand lazy service resolvers (never invoked during startup / menu boot)
 inline void* EnsureMetaClientResolved() {
+    if (!Il2Cpp::IsUnityObjectSafe(g_stashes.realMetaClient)) {
+        if (void* gmc = Il2Cpp::ResolveStaticClassFieldPtr("dev.Scripts.GlobalContexts", "GlobalContextCore", "MetaClientWrapper")) {
+            g_stashes.realMetaClient = gmc;
+        }
+    }
     if (!Il2Cpp::IsUnityObjectSafe(g_stashes.realMetaClient) && Il2Cpp::IsUnityObjectSafe(g_stashes.realContainer)) {
         g_stashes.realMetaClient = ResolveFromSimpleDImple(Offsets::g_cfg.nsFlakeFlow.c_str(), Offsets::g_cfg.clsMetaClientWrapper.c_str());
     }
@@ -2832,6 +2839,7 @@ inline void SaveProfile(const char* name) {
         @"freeCamOrbitDist": @(g_cfgState.freeCamOrbitDist),
         @"freeCamSpeed": @(g_cfgState.freeCamSpeed),
         @"bKillAroundGhostStep": @(g_cfgState.bKillAroundGhostStep),
+        @"bKillAroundIncludeVehicles": @(g_cfgState.bKillAroundIncludeVehicles),
         @"bKillAroundOneHit": @(g_cfgState.bKillAroundOneHit),
         @"killAroundRadius": @(g_cfgState.killAroundRadius),
         @"languageMode": @(g_cfgState.languageMode),
@@ -2905,6 +2913,7 @@ inline void LoadProfile(const char* name) {
     fVal(@"freeCamGhostDepthY", g_cfgState.freeCamGhostDepthY);
     fVal(@"freeCamOrbitDist", g_cfgState.freeCamOrbitDist);
     bVal(@"bKillAroundGhostStep", g_cfgState.bKillAroundGhostStep);
+    bVal(@"bKillAroundIncludeVehicles", g_cfgState.bKillAroundIncludeVehicles);
     bVal(@"bKillAroundOneHit", g_cfgState.bKillAroundOneHit);
     fVal(@"killAroundRadius", g_cfgState.killAroundRadius);
     fVal(@"freeCamSpeed", g_cfgState.freeCamSpeed);
